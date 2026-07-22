@@ -211,14 +211,18 @@ def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries = 200)
     return mode_idx, max_queries
 
 
-def main():
+def main(args):
     setup_logging()  # 初始化日志
 
-    filepath = 'datasets/4d_100000.txt'
-    D_np = load_dataset(filepath)[:1000]
+    filepath = args.data
+    D_np = load_dataset(filepath)
     if D_np is None:
-        return
-    num_experiments = 10
+        Exception("Wrong dataset path.")
+
+    if args.data_size < len(D_np):
+        D_np = D_np[:args.data_size]
+
+    num_experiments = args.rounds
 
     # 自动识别并配置 GPU / CPU 设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -231,7 +235,7 @@ def main():
 
     E_min = torch.min(D, dim=0)[0]
     E_max = torch.max(D, dim=0)[0]
-    RS_N = 5000
+    RS_N = args.N
 
     rs_results, at_results = [], []
     dirichlet_dist = torch.distributions.Dirichlet(torch.ones(d, device=device))

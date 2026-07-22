@@ -16,17 +16,6 @@ from typing import List, Tuple, Any, Optional
 
 from utils import *
 
-TORCH_DTYPE = torch.float32 # for 2D dataset, should be torch.float64 to ensure 100% accuracy
-if TORCH_DTYPE == torch.float32:
-    LP_ACC = 1e-06
-    LP_SAFE = 1e-07
-    ETA = 1e-07
-elif TORCH_DTYPE == torch.float64:
-    LP_ACC = 1e-08
-    LP_SAFE = 1e-09
-    ETA = 1e-10
-
-
 def at_find_nearest_neighbor(D: torch.Tensor, e: torch.Tensor, u: torch.Tensor) -> Tuple[int, torch.Tensor]:
     """
     【步骤 2】根据当前的锚点 (e, u) 在数据集 D 中找到加权距离平方最小的最近邻点 p
@@ -551,12 +540,29 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
 
 
 
-def main():
+def main(args):
+    global TORCH_DTYPE,  LP_ACC, LP_SAFE, ETA
+    if args.dtype == "float64":
+        TORCH_DTYPE = torch.float64
+        LP_ACC = 1e-08
+        LP_SAFE = 1e-09
+        ETA = 1e-10
+    else: # Default is float32. For 2D dataset, should be torch.float64 to ensure 100% accuracy
+        TORCH_DTYPE = torch.float32
+        LP_ACC = 1e-06
+        LP_SAFE = 1e-07
+        ETA = 1e-07
+
     setup_logging()  # 初始化日志    
-    filepath = 'datasets/4d_100000.txt'
-    D_np = load_dataset(filepath)[:1000]
+    filepath = args.data
+    D_np = load_dataset(filepath)
     if D_np is None:
-        return
+        Exception("Wrong dataset path.")
+
+    if args.data_size < len(D_np):
+        D_np = D_np[:args.data_size]
+
+    num_experiments = args.rounds
 
     # 自动识别并配置 GPU / CPU 设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -570,7 +576,6 @@ def main():
 
     E_min = torch.min(D, dim=0)[0]
     E_max = torch.max(D, dim=0)[0]
-    num_experiments = 3
 
     rs_results, at_results = [], []
     dirichlet_dist = torch.distributions.Dirichlet(torch.ones(d, device=device))
