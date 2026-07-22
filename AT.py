@@ -14,6 +14,8 @@ import time
 
 from typing import List, Tuple, Any, Optional
 
+from utils import *
+
 TORCH_DTYPE = torch.float32 # for 2D dataset, should be torch.float64 to ensure 100% accuracy
 if TORCH_DTYPE == torch.float32:
     LP_ACC = 1e-06
@@ -23,47 +25,6 @@ elif TORCH_DTYPE == torch.float64:
     LP_ACC = 1e-08
     LP_SAFE = 1e-09
     ETA = 1e-10
-
-# ==========================================
-# 0. 日志配置函数
-# ==========================================
-def setup_logging():
-    log_dir = "logs"
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = os.path.join(log_dir, f"experiment_{timestamp}.log")
-
-    file_handler = logging.FileHandler(log_filename, encoding='utf-8')
-    stream_handler = logging.StreamHandler()
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            file_handler,
-            stream_handler
-        ],
-        force=True
-    )
-    logging.info(f"日志文件已创建: {log_filename}")
-
-
-# ==========================================
-# 1. 通用辅助函数 (已重构为 PyTorch 算子)
-# ==========================================
-def get_weighted_distance_sq(D, e, u):
-    """计算数据集 D 中所有点到期望点 e 的加权距离平方 (支持多维广播)"""
-    return torch.sum(u * (D - e) ** 2, dim=-1)
-
-
-def simulate_user_oracle(p_idx, q_idx, D, true_e, true_u):
-    """模拟用户的真实选择 (Oracle)"""
-    dist_p = get_weighted_distance_sq(D[p_idx], true_e, true_u)
-    dist_q = get_weighted_distance_sq(D[q_idx], true_e, true_u)
-    return (dist_p < dist_q).item()
-
 
 
 def at_find_nearest_neighbor(D: torch.Tensor, e: torch.Tensor, u: torch.Tensor) -> Tuple[int, torch.Tensor]:
@@ -589,37 +550,11 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
     return rebuttal_q_idx, rounds, total_queries_used
 
 
-# ==========================================
-# 4. 数据加载与 Main 实验组装
-# ==========================================
-def load_dataset(filepath):
-    """解析带有 [n d] 开头的文本数据集"""
-    try:
-        with open(filepath, 'r') as f:
-            raw_data = f.read().split()
-
-        n, d = int(raw_data[0]), int(raw_data[1])
-
-        D = np.array(raw_data[2:2 + n * d], dtype=float).reshape(n, d)
-        col_min = D.min(axis=0)
-        col_max = D.max(axis=0)
-
-        # 计算极差，并加入 1e-8 的微小偏移量防止除以 0 的灾难（当某一整列数值全相同时）
-        range_val = np.maximum(col_max - col_min, 1e-8)
-
-        # 归一化公式： (X - X_min) / (X_max - X_min)
-        D_normalized = (D - col_min) / range_val
-
-        return D_normalized
-    except Exception as e:
-        print(f"数据加载失败，请检查文件路径和格式。错误: {e}")
-        return None
-
 
 def main():
     setup_logging()  # 初始化日志    
-    filepath = 'datasets/household.txt'
-    D_np = load_dataset(filepath)
+    filepath = 'datasets/4d_100000.txt'
+    D_np = load_dataset(filepath)[:1000]
     if D_np is None:
         return
 
@@ -636,7 +571,6 @@ def main():
     E_min = torch.min(D, dim=0)[0]
     E_max = torch.max(D, dim=0)[0]
     num_experiments = 3
-    RS_N = 100000
 
     rs_results, at_results = [], []
     dirichlet_dist = torch.distributions.Dirichlet(torch.ones(d, device=device))
@@ -646,7 +580,6 @@ def main():
     for i in range(num_experiments):
         logging.info(f"\n--- 实验 {i + 1}/{num_experiments} ---")
 
-        # 1. Oracle 生成 (在 GPU 上直接生成)
         true_u = dirichlet_dist.sample()
         true_e = E_min + torch.rand(d, device=device) * (E_max - E_min)
 
@@ -655,28 +588,7 @@ def main():
         best_distance = torch.min(distance).item()
         logging.info(f"  [Oracle] 用户的真实最优数据点索引为: {true_best_idx}")
 
-        # 2. 运行 RS
-        # start_time = time.time()
-        # rs_best_idx, rs_queries = range_shrink_algorithm(D, true_e, true_u, RS_N)
-        # rs_time = time.time() - start_time
-        # rs_success = (rs_best_idx == true_best_idx)
-        #
-        # # 评估指标计算 (处理收敛失败返回 -1 的边界情况，防止原本的 distance 报错问题)
-        # if rs_best_idx != -1:
-        #     sorted_indices = torch.argsort(distance)
-        #     rank = (sorted_indices == rs_best_idx).nonzero(as_tuple=True)[0][0].item()
-        #     dis_bias = (get_weighted_distance_sq(D[rs_best_idx], true_e, true_u).item() - best_distance) / best_distance
-        # else:
-        #     rank = n - 1
-        #     dis_bias = float('inf')
-        #
-        # rs_results.append(
-        #     {'queries': rs_queries, 'success': rs_success, 'time': rs_time, "dis_bias": dis_bias, "rank": rank})
-        #
-        # logging.info(
-        #     f"  [RS 算法] 返回点: {rs_best_idx} | 排名: {rank + 1}/{n} | 偏差: {dis_bias:.4f} | 次数: {rs_queries} | 命中: {rs_success}")
 
-        # 3. 运行 AT
         start_time = time.time()
         at_best_idx, rounds, at_queries = anchor_tracking_algorithm(D, true_e, true_u)
         at_time = time.time() - start_time
@@ -710,21 +622,6 @@ def main():
     logging.info(f"实验结果统计 ( {num_experiments}次平均)")
     logging.info("=" * 40)
 
-    # rs_avg_queries = np.mean([r['queries'] for r in rs_results if r['rank'] != (n-1)])
-    # rs_success_rate = np.mean([r['success'] for r in rs_results])
-    # rs_rank = np.mean([(r['rank']+1) for r in rs_results if r['rank'] != (n-1)])
-    # rs_top5 = np.sum([1 for r in rs_results if r['rank'] <= 5])
-    # rs_fail = np.sum([1 for r in rs_results if r['rank'] == (n-1)])
-    # rs_bias = np.mean([r['dis_bias'] for r in rs_results if r['rank'] != (n-1) ])
-    #
-    #
-    # logging.info(f"[Range Shrink] 采样点数: {RS_N}")
-    # logging.info(f"[Range Shrink] 命中率: {rs_success_rate:.4f}")
-    # logging.info(f"[Range Shrink] Top-5 命中率: {rs_top5:.4f}/{num_experiments}")
-    # logging.info(f"[Range Shrink] 平均排位: {rs_rank:.1f}/{n}")
-    # logging.info(f"[Range Shrink] 平均偏差: {rs_bias:.1f}")
-    # logging.info(f"[Range Shrink] 平均提问次数: {rs_avg_queries:.1f}")
-    # logging.info(f"[Range Shrink] 失败次数: {rs_fail}/{num_experiments}")
     at_valid_results = [r for r in at_results if r['rank'] != (n - 1)]
 
     if len(at_valid_results) > 0:
