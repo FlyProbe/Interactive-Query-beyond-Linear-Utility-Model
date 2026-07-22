@@ -1,0 +1,14 @@
+logs/
+carAT/
+carRS/
+islandAT/
+islandRS/
+nbaAT/
+nbaRS/
+4dAT/
+4dRS/
+generator/build
+generator/test
+*.pdf
+*.zip
+*.xlsx

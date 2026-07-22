@@ -1,0 +1,2 @@
+./a.out 6 0 1 1 A 300 6d.txt
+./a.out 6 0 1 1 E 100000 Indep6d.txt
