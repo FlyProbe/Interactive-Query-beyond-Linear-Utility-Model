@@ -132,7 +132,7 @@ def at_check_stopping_condition_LP(
         res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
 
         # 只要找到一个目标值 < 0 的反例，立刻终止并提取射线方向
-        if res.success and res.fun < -LP_ACC:
+        if res.success and res.fun < -LP_ACC-EPS: #TODO make it larger//dynanmic
             u_prime = res.x[:d]
             z_prime = res.x[d:]
 
@@ -541,7 +541,8 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
 
 
 def main(args):
-    global TORCH_DTYPE,  LP_ACC, LP_SAFE, ETA
+    global TORCH_DTYPE,  LP_ACC, LP_SAFE, ETA, EPS
+    EPS = args.eps
     if args.dtype == "float64":
         TORCH_DTYPE = torch.float64
         LP_ACC = 1e-08

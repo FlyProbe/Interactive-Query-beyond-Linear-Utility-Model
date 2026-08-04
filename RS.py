@@ -212,6 +212,9 @@ def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries = 200)
 
 
 def main(args):
+    global EPS
+
+    EPS = args.eps
     setup_logging()  # 初始化日志
 
     filepath = args.data
