@@ -131,7 +131,7 @@ def at_check_stopping_condition_LP(
         c = C_all[q_idx]
         res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
 
-        # 只要找到一个目标值 < 0 的反例，立刻终止并提取射线方向
+        # 只要找到一个目标值 < EPS 的反例，立刻终止并提取射线方向
         if res.success and res.fun < -LP_ACC-EPS: #TODO make it larger//dynanmic
             u_prime = res.x[:d]
             z_prime = res.x[d:]
@@ -598,7 +598,19 @@ def main(args):
         start_time = time.time()
         at_best_idx, rounds, at_queries = anchor_tracking_algorithm(D, true_e, true_u)
         at_time = time.time() - start_time
-        at_success = (at_best_idx == true_best_idx)
+        # at_success = (at_best_idx == true_best_idx)
+
+        if at_best_idx != -1:
+            # 获取 AT 算法找到的点的实际加权距离
+            at_distance = get_weighted_distance_sq(D[at_best_idx], true_e, true_u).item()
+            # 判断距离是否在允许的误差范围内：d <= d* * (1 + EPS)
+            at_success = (at_distance <= best_distance * (1 + EPS))
+        else:
+            # 如果算法未返回有效点，则直接判定为失败
+            at_distance = float('inf')
+            at_success = False
+
+
 
         # --- 新增：AT 评估指标计算 ---
         if at_best_idx != -1:
