@@ -13,18 +13,17 @@ import time
 
 from utils import *
 
-def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries = 200):
+def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries=200, eps=0.0):
     """
-    SMC + Hit-and-Run (贴边游走) 架构
+    SMC + Hit-and-Run (贴边游走) 架构 + 容差交集投票
     """
     device = D.device
     n, d = D.shape
-    H = []  # 记录偏好约束，格式为 (winner_idx, loser_idx)
+    H = []
 
     E_min = torch.min(D, dim=0)[0]
     E_max = torch.max(D, dim=0)[0]
 
-    # 全局初始化 N 个粒子 (e, u)
     e_samples = E_min + torch.rand(initial_N, d, device=device) * (E_max - E_min)
     dirichlet_dist = torch.distributions.Dirichlet(torch.ones(d, device=device))
     u_samples = dirichlet_dist.sample((initial_N,))
@@ -37,9 +36,7 @@ def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries = 200)
         rounds += 1
         tbar.update(1)
 
-        # ---------------------------------------------------------
         # 1. 产生交互与获取反馈
-        # ---------------------------------------------------------
         perm = torch.randperm(n, device=device)
         p_idx, q_idx = perm[0].item(), perm[1].item()
 
@@ -50,9 +47,7 @@ def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries = 200)
 
         H.append((winner_idx, loser_idx))
 
-        # ---------------------------------------------------------
         # 2. 筛选幸存者
-        # ---------------------------------------------------------
         valid_mask = torch.ones(initial_N, dtype=torch.bool, device=device)
         for w_idx, l_idx in H:
             dist_w = get_weighted_distance_sq(D[w_idx], e_samples, u_samples)
@@ -62,12 +57,9 @@ def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries = 200)
         num_survivors = valid_mask.sum().item()
         num_dead = initial_N - num_survivors
 
-        # ---------------------------------------------------------
-        # 3. 锦标赛兜底 (如果当前反馈导致全军覆没)
-        # ---------------------------------------------------------
+        # 3. 锦标赛兜底 (全军覆没情况)
         if num_survivors == 0:
-            H.pop()  # 撤销致命约束
-            # 利用上一轮的合法粒子重新计算投票
+            H.pop()
             prev_votes = []
             chunk_size = 5000
             for i in range(0, initial_N, chunk_size):
@@ -77,8 +69,6 @@ def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries = 200)
                 prev_votes.append(torch.argmin(dist_chunk, dim=-1))
 
             unique_candidates = torch.unique(torch.cat(prev_votes))
-
-            # 对幸存的候选答案进行锦标赛两两对决
             best_idx = unique_candidates[0].item()
             for i in range(1, len(unique_candidates)):
                 competitor_idx = unique_candidates[i].item()
@@ -87,28 +77,58 @@ def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries = 200)
                 if not simulate_user_oracle(best_idx, competitor_idx, D, true_e, true_u):
                     best_idx = competitor_idx
             tbar.close()
-            return best_idx, rounds
+            # 统一返回列表格式
+            return [best_idx], rounds
 
         # ---------------------------------------------------------
-        # 4. 存活者投票收敛判定
+        # 4. 存活者容差交集投票判定 (核心修改区)
         # ---------------------------------------------------------
         survivors_e = e_samples[valid_mask]
         survivors_u = u_samples[valid_mask]
 
-        votes = []
+        # 初始化交集掩码，初始认为所有点都在交集中
+        intersection_mask = torch.ones(n, dtype=torch.bool, device=device)
         chunk_size = 5000
+
         for i in range(0, num_survivors, chunk_size):
             e_chunk = survivors_e[i: i + chunk_size].unsqueeze(1)
             u_chunk = survivors_u[i: i + chunk_size].unsqueeze(1)
+
+            # 计算距离平方
             dist_chunk = torch.sum(u_chunk * (D.unsqueeze(0) - e_chunk) ** 2, dim=-1)
-            votes.append(torch.argmin(dist_chunk, dim=-1))
 
-        unique_votes = torch.unique(torch.cat(votes))
+            # 寻找每个粒子到数据集的最短距离的平方 d^2
+            min_dist_sq = torch.min(dist_chunk, dim=-1, keepdim=True)[0]
 
-        if len(unique_votes) == 1:
+            # 宽容度阈值: d^2 * (1 + eps)^2
+            threshold_sq = min_dist_sq * ((1.0 + eps) ** 2)
+
+            # (2) 投出距离 d(1+eps) 范围内的所有点
+            vote_mask = dist_chunk <= threshold_sq
+
+            # 计算当前 chunk 内部所有粒子的共识交集
+            chunk_intersection = torch.all(vote_mask, dim=0)
+            intersection_mask &= chunk_intersection
+
+        # 提取交集内的所有元素
+        intersection_indices = torch.nonzero(intersection_mask).squeeze(-1)
+
+        # 如果所有存活粒子的返回列表有交集，则直接返回交集内的所有元素
+        if len(intersection_indices) > 0:
             tbar.close()
-            return unique_votes[0].item(), rounds - 1
-        elif len(unique_votes) <= 5 and rounds == max_queries:
+            return intersection_indices.tolist(), rounds - 1
+
+        elif rounds == max_queries:
+            # 如果到达 max_queries 仍无交集，退化为锦标赛或返回得票最多的集合
+            # 为保持严谨，这里取传统最近邻模式的众数作为 Fallback
+            votes = []
+            for i in range(0, num_survivors, chunk_size):
+                e_chunk = survivors_e[i: i + chunk_size].unsqueeze(1)
+                u_chunk = survivors_u[i: i + chunk_size].unsqueeze(1)
+                dist_chunk = torch.sum(u_chunk * (D.unsqueeze(0) - e_chunk) ** 2, dim=-1)
+                votes.append(torch.argmin(dist_chunk, dim=-1))
+
+            unique_votes = torch.unique(torch.cat(votes))
             best_idx = unique_votes[0].item()
             for i in range(1, len(unique_votes)):
                 competitor_idx = unique_votes[i].item()
@@ -117,7 +137,7 @@ def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries = 200)
                 if not simulate_user_oracle(best_idx, competitor_idx, D, true_e, true_u):
                     best_idx = competitor_idx
             tbar.close()
-            return best_idx, rounds
+            return [best_idx], rounds
 
         # ---------------------------------------------------------
         # 5. Hit-and-Run 定向贴边补齐阵亡粒子
@@ -127,15 +147,13 @@ def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries = 200)
             c_e = survivors_e[clone_idx]
             c_u = survivors_u[clone_idx]
 
-            # 生成随机方向 (归一化以保证计算稳定性)
             Delta_e = torch.randn_like(c_e)
             Delta_e = Delta_e / torch.norm(Delta_e, dim=-1, keepdim=True)
 
             Delta_u = torch.randn_like(c_u)
-            Delta_u = Delta_u - Delta_u.mean(dim=-1, keepdim=True)  # 保证 sum = 0
+            Delta_u = Delta_u - Delta_u.mean(dim=-1, keepdim=True)
             Delta_u = Delta_u / (torch.norm(Delta_u, dim=-1, keepdim=True) + 1e-9)
 
-            # --- A. 计算物理边界 t_phys ---
             t_e_min = torch.where(Delta_e < 0, (E_min - c_e) / Delta_e, float('inf'))
             t_e_max = torch.where(Delta_e > 0, (E_max - c_e) / Delta_e, float('inf'))
             t_e = torch.minimum(t_e_min.min(dim=-1)[0], t_e_max.min(dim=-1)[0])
@@ -145,8 +163,6 @@ def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries = 200)
             t_u = torch.minimum(t_u_min.min(dim=-1)[0], t_u_max.min(dim=-1)[0])
 
             t_phys = torch.minimum(t_e, t_u)
-
-            # --- B. 计算逻辑边界 t_logic (二次项完美抵消的一元二次方程) ---
             t_logic = torch.full((num_dead,), float('inf'), device=device)
 
             for w_idx, l_idx in H:
@@ -161,34 +177,23 @@ def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries = 200)
                 a = torch.sum(Delta_u * D_mat, dim=-1)
 
                 disc = b ** 2 - 4 * a * c
-
-                # 求一元二次方程根 (掩码处理无解或负解的情况)
-                # t1 = (-b + sqrt(disc)) / 2a ; t2 = (-b - sqrt(disc)) / 2a
                 t1 = torch.where(a != 0, (-b + torch.sqrt(torch.clamp(disc, min=0))) / (2 * a + 1e-12),
                                  -c / (b + 1e-12))
                 t2 = torch.where(a != 0, (-b - torch.sqrt(torch.clamp(disc, min=0))) / (2 * a + 1e-12), float('inf'))
 
-                # 寻找最小正实根 (排除漂移的负数或极小值)
                 t1 = torch.where((disc >= 0) & (t1 > 1e-6), t1, float('inf'))
                 t2 = torch.where((disc >= 0) & (t2 > 1e-6), t2, float('inf'))
 
                 t_h_min = torch.minimum(t1, t2)
                 t_logic = torch.minimum(t_logic, t_h_min)
 
-            # --- C. 贴边跃迁  ---
             t_max = torch.minimum(t_phys, t_logic)
-
-            # 0.9比例
-            # t_step = 0.9 * t_max
-
-            # 随机
             rand_ratios = torch.rand(num_dead, device=device)
             t_step = rand_ratios * 0.999 * t_max
 
             new_e = c_e + t_step.unsqueeze(-1) * Delta_e
             new_u = c_u + t_step.unsqueeze(-1) * Delta_u
 
-            # 安全归一化兜底 (防止浮点精度误差导致越界)
             new_e = torch.max(torch.min(new_e, E_max), E_min)
             new_u = torch.clamp(new_u, 0.001, 1.0)
             new_u = new_u / new_u.sum(dim=-1, keepdim=True)
@@ -198,7 +203,7 @@ def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries = 200)
 
     tbar.close()
 
-    # 达到 max_queries 未收敛，取最后状态投票的众数作为 Fallback
+    # 达到 max_queries 未收敛兜底
     votes = []
     for i in range(0, initial_N, 5000):
         e_chunk = e_samples[i: i + 5000].unsqueeze(1)
@@ -208,11 +213,11 @@ def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries = 200)
 
     final_votes = torch.cat(votes)
     mode_idx = torch.mode(final_votes)[0].item()
-    return mode_idx, max_queries
+    return [mode_idx], max_queries
 
 
 def main(args):
-    global EPS
+    # global EPS
 
     EPS = args.eps
     setup_logging()  # 初始化日志
@@ -259,25 +264,46 @@ def main(args):
 
         # 2. 运行 RS
         start_time = time.time()
-        rs_best_idx, rs_queries = range_shrink_algorithm(D, true_e, true_u, RS_N)
+        # 注意：此处返回的 rs_best_indices 是一个 List
+        rs_best_indices, rs_queries = range_shrink_algorithm(D, true_e, true_u, RS_N, max_queries=200, eps=EPS)
         rs_time = time.time() - start_time
-        rs_success = (rs_best_idx == true_best_idx)
 
-        # 评估指标计算 (处理收敛失败返回 -1 的边界情况，防止原本的 distance 报错问题)
-        if rs_best_idx != -1:
+        # 评估指标计算
+        if rs_best_indices and len(rs_best_indices) > 0:
             sorted_indices = torch.argsort(distance)
-            rank = (sorted_indices == rs_best_idx).nonzero(as_tuple=True)[0][0].item()
-            dis_bias = (get_weighted_distance_sq(D[rs_best_idx], true_e, true_u).item() - best_distance) / best_distance
-        else:
-            rank = n - 1
-            dis_bias = float('inf')
 
-        rs_results.append(
-            {'queries': rs_queries, 'success': rs_success, 'time': rs_time, "dis_bias": dis_bias, "rank": rank})
+            # 分别计算列表中每一个点的 rank，并找出最差（最大）的 rank
+            ranks = [(sorted_indices == idx).nonzero(as_tuple=True)[0][0].item() for idx in rs_best_indices]
+            worst_rank = max(ranks)
+
+            # 找到对应最差 rank 的那个索引
+            worst_idx = rs_best_indices[ranks.index(worst_rank)]
+
+            # 计算该最差点到真值的距离平方
+            worst_distance_sq = distance[worst_idx].item()
+
+            # Bias 计算 (保持原算法距离平方差的比例计算结构)
+            dis_bias = (worst_distance_sq - best_distance) / (best_distance + 1e-12)
+
+            # 命中判断：真实距离 d_i 是否在 d*(1+eps) 范围内。
+            # 数学等价于：最差点的距离平方 <= 最佳点的距离平方 * (1 + eps)^2
+            rs_success = worst_distance_sq <= best_distance * ((1.0 + EPS) ** 2)
+        else:
+            # 极端异常防崩溃兜底
+            worst_rank = n - 1
+            dis_bias = float('inf')
+            rs_success = False
+
+        rs_results.append({
+            'queries': rs_queries,
+            'success': rs_success,
+            'time': rs_time,
+            'dis_bias': dis_bias,
+            'rank': worst_rank
+        })
 
         logging.info(
-            f"  [RS 算法] 返回点: {rs_best_idx} | 排名: {rank + 1}/{n} | 偏差: {dis_bias:.4f} | 次数: {rs_queries} | 命中: {rs_success}")
-
+            f"  [RS 算法] 返回交集大小: {len(rs_best_indices)} | 最差排名: {worst_rank + 1}/{n} | 最差偏差: {dis_bias:.4f} | 次数: {rs_queries} | 命中: {rs_success}")
     # 5. 统计报告
     logging.info("\n" + "=" * 40)
     logging.info(f"实验结果统计 ( {num_experiments}次平均)")
