@@ -132,7 +132,7 @@ def at_check_stopping_condition_LP(
         res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
 
         # 只要找到一个目标值 < EPS 的反例，立刻终止并提取射线方向
-        if res.success and res.fun < -LP_ACC-EPS: #TODO make it larger//dynanmic
+        if res.success and res.fun < -LP_ACC:
             u_prime = res.x[:d]
             z_prime = res.x[d:]
 
@@ -429,12 +429,6 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
         _rebuttal_q_idx, _e_prime, _u_prime = at_check_stopping_condition_LP(H, D, p_idx, e, u, visited_rebuttals, device=device)
         if len(_rebuttal_q_idx) == 0:
             logging.info("Ending-LP")
-            # distance = get_weighted_distance_sq(D, true_e, true_u)
-            # true_best_idx = torch.argmin(distance).item()
-            # if p_idx != true_best_idx:
-            #     visited_rebuttals = set(range(0, 20000)) - {true_best_idx}
-            #     _rebuttal_q_idx, _e_prime, _u_prime = at_check_stopping_condition_LP(H, D, p_idx, e, u,
-            #                                                                          visited_rebuttals, device=device)
             pbar.close()
             return p_idx, rounds, total_queries_used
 

@@ -8,7 +8,7 @@ def parse_args():
     parser.add_argument('--alg', type=str, default='RS')
     parser.add_argument('--data_size', type=int, default=10000)
     parser.add_argument('--rounds',  type=int, default=100)
-    parser.add_argument("--eps", type=float, default=0.001)
+    parser.add_argument("--eps", type=float, default=0.0)
     # for AT
     parser.add_argument('--dtype',  type=str, default="float32")
     # for RS
