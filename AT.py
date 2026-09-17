@@ -156,68 +156,83 @@ def at_check_stopping_condition_LP(
     return q_idx_list, e_list, u_list
 
 
-def at_construct_q_chain(D: torch.Tensor, e_prime: torch.Tensor, u: torch.Tensor, delta_u: torch.Tensor):
+def at_construct_q_chain_alternating(D: torch.Tensor, e: torch.Tensor, u: torch.Tensor,
+                                     e_prime: torch.Tensor, u_prime: torch.Tensor,
+                                     vary_u: bool):
     """
-    【步骤 3】利用纯张量下包络线（Lower Envelope）算法，构造单调最近点路径（Monotone Path）。
+    【步骤 3】支持交替策略的下包络线（Lower Envelope）算法构造单调最近点路径。
 
     参数:
-        D (torch.Tensor): 核心候选数据集，形状为 (N, d)
-        e (torch.Tensor): 当前锚点的期望中心向量，形状为 (d,)
-        u (torch.Tensor): 当前锚点的属性权重向量，形状为 (d,)
-        delta_u (torch.Tensor): 指向反驳点的权重扰动方向，形状为 (d,)
-
-    返回:
-        q_chain (List[int]): 构成单调路径的数据点索引列表，按 eta 递增顺序排列。
+        vary_u (bool): True 表示变动 u 固定 e；False 表示变动 e 固定 u。
     """
-    # ---------------------------------------------------------
-    # 核心映射：将所有点转化为关于步长 eta 的直线方程 g(p, eta) = A + B * eta
-    # ---------------------------------------------------------
-    # A_p = \sum u_i (p_i - e_i)^2   (即 eta = 0 时的原始加权距离)
-    A = torch.sum(u * (D - e_prime) ** 2, dim=-1)
+    if vary_u:
+        # ---------------------------------------------------------
+        # 模式 1：固定 e_prime，变动 u (u + eta * delta_u)
+        # ---------------------------------------------------------
+        delta_u = u_prime - u
+        # A_p = \sum u_i (p_i - e_prime_i)^2
+        A = torch.sum(u * (D - e_prime) ** 2, dim=-1)
+        # B_p = \sum \Delta u_i (p_i - e_prime_i)^2
+        B = torch.sum(delta_u * (D - e_prime) ** 2, dim=-1)
 
-    # B_p = \sum \Delta u_i (p_i - e_i)^2  (即距离随 eta 变化的斜率)
-    B = torch.sum(delta_u * (D - e_prime) ** 2, dim=-1)
+        curr_p = torch.argmin(A).item()
+        q_chain = [curr_p]
+        q_chain_eu = [(e_prime, u.clone())]
 
-    # 初始状态 eta = 0 时的最优解，必然是我们步骤 2 找到的 p_idx
-    curr_p = torch.argmin(A).item()
-    q_chain = [curr_p]
-    q_chain_eu = [(e_prime, u.clone())]
+        while True:
+            valid_mask = B < B[curr_p]
+            if not valid_mask.any():
+                break
 
-    # ---------------------------------------------------------
-    # 下包络线（Lower Envelope）极速扫描
-    # ---------------------------------------------------------
-    while True:
-        # 寻找交点：eta = (A_curr - A_i) / (B_i - B_curr)
-        # 几何法则：只有斜率更小的线（B_i < B_curr），才有可能在未来的正半轴击败当前最优线
-        valid_mask = B < B[curr_p]
+            numerator = A[curr_p] - A
+            denominator = B - B[curr_p]
+            eta_intersections = numerator / denominator
 
-        # 如果没有任何一条线的斜率比当前线更小，说明当前点将永远统治未来的 eta，路径终止
-        if not valid_mask.any():
-            break
+            eta_intersections[~valid_mask] = float('inf')
+            eta_intersections[eta_intersections <= ETA] = float('inf')
 
-        # A1 + B1η = A2 + B2η
-        # n = (A1-A2)/(B2-B1)
+            next_p = torch.argmin(eta_intersections).item()
+            if eta_intersections[next_p] == float('inf'):
+                break
 
-        numerator = A[curr_p] - A
-        denominator = B - B[curr_p]
+            curr_p = next_p
+            q_chain.append(curr_p)
+            q_chain_eu.append((e_prime, u + eta_intersections[next_p] * delta_u))
 
-        eta_intersections = numerator / denominator
+    else:
+        # ---------------------------------------------------------
+        # 模式 2：固定 u_prime，变动 e (e + eta * delta_e)
+        # ---------------------------------------------------------
+        delta_e = e_prime - e
+        # A_p = \sum u_prime_i (p_i - e_i)^2
+        A = torch.sum(u_prime * (D - e) ** 2, dim=-1)
+        # B_p = -2 * \sum u_prime_i (p_i - e_i) * \Delta e_i
+        # 注意：此处二阶项 eta^2 在求交点差值时已抵消，所以斜率 B 仅保留一阶交叉项
+        B = -2.0 * torch.sum(u_prime * D * delta_e, dim=-1)
 
-        # 过滤机制：排除掉不符合斜率条件的非法交点，以及过去/极近的交点（使用 1e-7 防止浮点精度导致的无限原地循环）
-        eta_intersections[~valid_mask] = float('inf')
-        eta_intersections[eta_intersections <= ETA] = float('inf')
+        curr_p = torch.argmin(A).item()
+        q_chain = [curr_p]
+        q_chain_eu = [(e.clone(), u_prime)]
 
-        # 在所有合法的未来交点中，寻找最早发生的那个交点（即最小的 eta）
-        next_p = torch.argmin(eta_intersections).item()
+        while True:
+            valid_mask = B < B[curr_p]
+            if not valid_mask.any():
+                break
 
-        # 如果算出来的最小 eta 也是正无穷，说明剩下的线只在负半轴相交，未来不再有交点，路径终止
-        if eta_intersections[next_p] == float('inf'):
-            break
+            numerator = A[curr_p] - A
+            denominator = B - B[curr_p]
+            eta_intersections = numerator / denominator
 
-            # 权杖交接：更新当前统治者，将其加入链条
-        curr_p = next_p
-        q_chain.append(curr_p)
-        q_chain_eu.append((e_prime, u+eta_intersections[next_p]*delta_u))
+            eta_intersections[~valid_mask] = float('inf')
+            eta_intersections[eta_intersections <= ETA] = float('inf')
+
+            next_p = torch.argmin(eta_intersections).item()
+            if eta_intersections[next_p] == float('inf'):
+                break
+
+            curr_p = next_p
+            q_chain.append(curr_p)
+            q_chain_eu.append((e + eta_intersections[next_p] * delta_e, u_prime))
 
     return q_chain, q_chain_eu
 
@@ -434,9 +449,19 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
 
         rebuttal_q_idx, e_prime, u_prime = _rebuttal_q_idx[0], _e_prime[0], _u_prime[0]
 
+        # 决定当前轮次走哪一个方向，利用偶数轮更新 u，奇数轮更新 e
+        vary_u = (rounds % 2 == 0)
+        vary_u = True
 
-        delta_u = u_prime - u
-        q_chain, q_chain_eu = at_construct_q_chain(D, e_prime, u, delta_u)
+        # 调用交替构建逻辑
+        q_chain, q_chain_eu = at_construct_q_chain_alternating(
+            D=D,
+            e=e,
+            u=u,
+            e_prime=e_prime,
+            u_prime=u_prime,
+            vary_u=vary_u
+        )
 
         # P不好-跳转
         p = torch.sum(true_u * (D[p_idx] - true_e) ** 2)
