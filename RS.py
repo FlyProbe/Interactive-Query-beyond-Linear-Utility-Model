@@ -10,7 +10,7 @@ import torch  # 引入 PyTorch
 
 from tqdm import tqdm
 import time
-
+import json
 from utils import *
 
 def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries=200, eps=0.0):
@@ -44,6 +44,7 @@ def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries=200, e
             winner_idx, loser_idx = p_idx, q_idx
         else:
             winner_idx, loser_idx = q_idx, p_idx
+        DATA["Time"].append(time.time() - DATA["Time"][0])
 
         H.append((winner_idx, loser_idx))
 
@@ -85,6 +86,8 @@ def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries=200, e
         # ---------------------------------------------------------
         survivors_e = e_samples[valid_mask]
         survivors_u = u_samples[valid_mask]
+
+        DATA["E-U Route"].append([torch.mean(survivors_e, axis=0).tolist(), torch.mean(survivors_u, axis=0).tolist()])
 
         # 初始化交集掩码，初始认为所有点都在交集中
         intersection_mask = torch.ones(n, dtype=torch.bool, device=device)
@@ -218,6 +221,9 @@ def range_shrink_algorithm(D, true_e, true_u, initial_N=5000, max_queries=200, e
 
 def main(args):
     # global EPS
+    global DATA
+    DEBUG = True
+    ROUTE_PATH = "4d10kRS"
 
     EPS = args.eps
     setup_logging()  # 初始化日志
@@ -253,17 +259,30 @@ def main(args):
     for i in range(num_experiments):
         logging.info(f"\n--- 实验 {i + 1}/{num_experiments} ---")
 
+        DATA = {
+            "Best P": [],
+            "E-U Route": [],
+            "True E-U": [],
+            "Time": []
+        }
+
         # 1. Oracle 生成 (在 GPU 上直接生成)
         true_u = dirichlet_dist.sample()
         true_e = E_min + torch.rand(d, device=device) * (E_max - E_min)
+
+        DATA["True E-U"] = [true_e.tolist(), true_e.tolist()]
 
         distance = get_weighted_distance_sq(D, true_e, true_u)
         true_best_idx = torch.argmin(distance).item()
         best_distance = torch.min(distance).item()
         logging.info(f"  [Oracle] 用户的真实最优数据点索引为: {true_best_idx}")
 
+        DATA["Best P"] = D[true_best_idx].tolist()
+
         # 2. 运行 RS
         start_time = time.time()
+
+        DATA["Time"].append(start_time)
         # 注意：此处返回的 rs_best_indices 是一个 List
         rs_best_indices, rs_queries = range_shrink_algorithm(D, true_e, true_u, RS_N, max_queries=200, eps=EPS)
         rs_time = time.time() - start_time
@@ -304,6 +323,10 @@ def main(args):
 
         logging.info(
             f"  [RS 算法] 返回交集大小: {len(rs_best_indices)} | 最差排名: {worst_rank + 1}/{n} | 最差偏差: {dis_bias:.4f} | 次数: {rs_queries} | 命中: {rs_success}")
+        DATA["Time"][0] = 0
+        if DEBUG:
+            with open(os.path.join(ROUTE_PATH, f"rs_route_{i}.json"), "w") as f:
+                json.dump(DATA, f)
     # 5. 统计报告
     logging.info("\n" + "=" * 40)
     logging.info(f"实验结果统计 ( {num_experiments}次平均)")

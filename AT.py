@@ -11,6 +11,7 @@ import torch  # 引入 PyTorch
 import torch.nn.functional as F
 from tqdm import tqdm
 import time
+import json
 
 from typing import List, Tuple, Any, Optional
 
@@ -54,29 +55,21 @@ def at_check_stopping_condition_LP(
 ) -> Tuple[Optional[int], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     【附加控制步】利用线性规划(LP)检查当前最优解 p 是否满足终止条件。
-    如果不满足，则找出一个反驳点 q，并返回用于构建后续单调路径的 e_prime 和 u_prime。
-
-    返回:
-        rebuttal_q_idx (int 或 None): 找到的反驳点索引。如果为 None，说明绝对收敛。
-        e_prime (torch.Tensor): LP 解出的反驳期望点
-        u_prime (torch.Tensor): LP 解出的反驳权重
+    如果不满足，则找出【第一个】反驳点 q（按距离由近及远），并返回。
+    去除了冗余的 List 列表包装，直接返回单个反驳点及参数。
     """
     n, d = D.shape
     p_star = D[p_idx]
 
-    # 获取各维度的最大值，用于修复 z <= u * E_max 的动态边界
     E_max = torch.max(D, dim=0)[0]
 
-    # ----------------------------------------------------
-    # 核心优化 1：GPU 内核矩阵化预组装 (Zero-Loop Construction)
-    # ----------------------------------------------------
+    # --- 1. GPU 内核矩阵化预组装约束 ---
     if len(history_constraints) > 0:
         winners = torch.tensor([h[0] for h in history_constraints], dtype=torch.long, device=device)
         losers = torch.tensor([h[1] for h in history_constraints], dtype=torch.long, device=device)
         P_k = D[winners]
         Q_k = D[losers]
 
-        # 约束: g(p) - g(q) <= 0
         u_coefs_H = P_k ** 2 - Q_k ** 2
         z_coefs_H = -2 * (P_k - Q_k)
         A_ub_H = torch.cat([u_coefs_H, z_coefs_H], dim=-1)
@@ -85,75 +78,54 @@ def at_check_stopping_condition_LP(
         A_ub_H = torch.empty((0, 2 * d), device=device)
         b_ub_H = torch.empty((0,), device=device)
 
-    # 边界约束: z_i - u_i <= 0
     A_ub_bounds = torch.zeros((d, 2 * d), device=device)
     A_ub_bounds[torch.arange(d), torch.arange(d)] = -1.0
     A_ub_bounds[torch.arange(d), torch.arange(d) + d] = 1.0
     b_ub_bounds = torch.zeros(d, device=device)
 
-    # 统一合并并转移到 CPU 内存 (仅传输一次)
     A_ub = torch.cat([A_ub_H, A_ub_bounds], dim=0).cpu().numpy()
     b_ub = torch.cat([b_ub_H, b_ub_bounds], dim=0).cpu().numpy()
 
-    # 等式约束: sum(u_i) = 1
     A_eq = np.zeros((1, 2 * d))
     A_eq[0, :d] = 1.0
     b_eq = np.array([1.0])
 
-    # 变量边界: u_i in [0, 1], z_i in [0, 1)
     E_max_val = torch.max(D).item()
     bounds = [(0, 1)] * d + [(0, E_max_val)] * d
 
-    # ----------------------------------------------------
-    # 核心优化 2：智能排序与极速早停 (Lazy Evaluation)
-    # ----------------------------------------------------
+    # --- 2. 智能排序与极速早停 (Lazy Evaluation) ---
     D_np = D.cpu().numpy()
     p_star_np = p_star.cpu().numpy()
 
-    # 预计算所有点作为 q 时的目标函数系数 C
     u_coefs_obj = D_np ** 2 - p_star_np ** 2
     z_coefs_obj = -2 * (D_np - p_star_np)
     C_all = np.concatenate([u_coefs_obj, z_coefs_obj], axis=-1)
 
-    # 计算当前锚点下所有点到 e 的距离，由近及远排序
     current_distances = torch.sum(u * (D - e) ** 2, dim=-1)
     sorted_q_indices = torch.argsort(current_distances).cpu().numpy()
 
-    q_idx_list = []
-    e_list = []
-    u_list = []
-
-    # 按可能性从大到小依次向 SciPy 喂数据
     for q_idx in sorted_q_indices:
+        q_idx = int(q_idx)
         if q_idx == p_idx or q_idx in visited_rebuttals:
             continue
 
         c = C_all[q_idx]
         res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
 
-        # 只要找到一个目标值 < EPS 的反例，立刻终止并提取射线方向
         if res.success and res.fun < -LP_ACC:
             u_prime = res.x[:d]
             z_prime = res.x[d:]
 
-            # 核心优化 3：安全反解，防除零溢出
             u_safe = np.clip(u_prime, LP_SAFE, None)
             e_prime = z_prime / u_safe
 
-            # 将解转回 GPU 张量并返回
             u_prime_tensor = torch.tensor(u_prime, dtype=TORCH_DTYPE, device=device)
             e_prime_tensor = torch.tensor(e_prime, dtype=TORCH_DTYPE, device=device)
 
-            q_idx_list.append(int(q_idx))
-            e_list.append(e_prime_tensor)
-            u_list.append(u_prime_tensor)
+            # 【去除 List，直接触发早停并返回单一结果】
+            return q_idx, e_prime_tensor, u_prime_tensor
 
-            if len(q_idx_list) > 5:
-                break
-            # return int(q_idx), e_prime_tensor, u_prime_tensor
-
-    # 如果遍历完毕没有任何点能击败 p_star，算法绝对收敛
-    return q_idx_list, e_list, u_list
+    return None, None, None
 
 
 def at_construct_q_chain_alternating(D: torch.Tensor, e: torch.Tensor, u: torch.Tensor,
@@ -275,6 +247,7 @@ def at_interactive_binary_search(
         user_prefers_left = dist_left < dist_right
 
         queries_used += 1
+        DATA["Time"].append(time.time() - DATA["Time"][0])
 
 
         # ----------------------------------------------------
@@ -406,13 +379,9 @@ def at_alternating_learning(
 
 
 def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
-    # [AT 主框架] 算法启动
     device = D.device
     d = D.shape[1]
 
-    # ----------------------------------------------------
-    # 步骤 1: (Init) 随机生成一组 e 和 u
-    # ----------------------------------------------------
     E_min = torch.min(D, dim=0)[0]
     E_max = torch.max(D, dim=0)[0]
     e = E_min + torch.rand(d, device=device) * (E_max - E_min)
@@ -420,10 +389,8 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
     dirichlet_dist = torch.distributions.Dirichlet(torch.ones(d, device=device))
     u = dirichlet_dist.sample()
 
-    # 初始化历史约束集合 H (用于存储用户对特定元组对的反馈)
     H = []
     total_queries_used = 0
-
     rounds = 0
 
     visited_rebuttals = set()
@@ -432,69 +399,50 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
     previous_u = u
     previous_qchain = []
 
-
     pbar = tqdm(total=max_round)
     while rounds < max_round:
 
-        # ----------------------------------------------------
-        # 步骤 2: 根据这一组 e 和 u 找到最近邻的 p
-        # ----------------------------------------------------
         p_idx, p_val = at_find_nearest_neighbor(D, e, u)
 
-        _rebuttal_q_idx, _e_prime, _u_prime = at_check_stopping_condition_LP(H, D, p_idx, e, u, visited_rebuttals, device=device)
-        if len(_rebuttal_q_idx) == 0:
+        # 【直接接收单一返回值】
+        rebuttal_q_idx, e_prime, u_prime = at_check_stopping_condition_LP(H, D, p_idx, e, u, visited_rebuttals,
+                                                                          device=device)
+
+        # 判定是否收敛
+        if rebuttal_q_idx is None:
             logging.info("Ending-LP")
             pbar.close()
             return p_idx, rounds, total_queries_used
 
-        rebuttal_q_idx, e_prime, u_prime = _rebuttal_q_idx[0], _e_prime[0], _u_prime[0]
-
-        # 决定当前轮次走哪一个方向，利用偶数轮更新 u，奇数轮更新 e
         vary_u = (rounds % 2 == 0)
-        vary_u = True
 
-        # 调用交替构建逻辑
         q_chain, q_chain_eu = at_construct_q_chain_alternating(
-            D=D,
-            e=e,
-            u=u,
-            e_prime=e_prime,
-            u_prime=u_prime,
-            vary_u=vary_u
+            D=D, e=e, u=u, e_prime=e_prime, u_prime=u_prime, vary_u=vary_u
         )
 
-        # P不好-跳转
         p = torch.sum(true_u * (D[p_idx] - true_e) ** 2)
         q = torch.sum(true_u * (D[rebuttal_q_idx] - true_e) ** 2)
         user_prefers_p = p < q
         total_queries_used += 1
+
         if not user_prefers_p:
-            # print(f"touch0:P:{p_idx}-->Q:{rebuttal_q_idx}")
+            # P不好-跳转
             if (rebuttal_q_idx, p_idx) in H:
                 visited_rebuttals.add(p_idx)
-                # visited_rebuttals.add(rebuttal_q_idx)
             else:
                 H.append((rebuttal_q_idx, p_idx))
-            # e, u = find_eu_making_q_nearest(D, rebuttal_q_idx, device=device)
-            # q_idx, _ = at_find_nearest_neighbor(D, e, u)
+
             e = e_prime
             u = u_prime
+            DATA["E-U Route"].append([e.tolist(), u.tolist()])
+            DATA["Time"].append(time.time() - DATA["Time"][0])
             rounds += 1
             pbar.update(1)
         else:
             # P好-不重复-走后续流程
-            # print("touched1.5")
             H.append((p_idx, rebuttal_q_idx))
-            if q_chain != previous_qchain or p_idx != previous_p_idx or (not torch.equal(e, previous_e)) or (not torch.equal(u, previous_u)):
-                # if  q_chain != previous_qchain:
-                #     print(1, end="")
-                # if p_idx != previous_p_idx:
-                #     print(2, end="")
-                # if (not torch.equal(e, previous_e)):
-                #     print(3, end="")
-                # if (not torch.equal(u, previous_u)):
-                #     print(4, end="")
-                # print("")
+            if q_chain != previous_qchain or p_idx != previous_p_idx or (not torch.equal(e, previous_e)) or (
+            not torch.equal(u, previous_u)):
                 visited_rebuttals.clear()
                 previous_p_idx = p_idx
                 previous_e = e
@@ -502,57 +450,52 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
                 previous_qchain = q_chain
 
                 final_q, queries, H = at_interactive_binary_search(
-                    D=D,
-                    q_chain=q_chain,
-                    oracle_e=true_e,
-                    oracle_u=true_u,
-                    history_constraints=H
+                    D=D, q_chain=q_chain, oracle_e=true_e, oracle_u=true_u, history_constraints=H
                 )
                 total_queries_used += queries
                 e, u = at_alternating_learning(D, H, e, u, device=device)
+                DATA["E-U Route"].extend([[e.tolist(), u.tolist()]]* queries)
+
+
                 rounds += 1
                 pbar.update(1)
             else:
-                # P好，重复-锦标赛
+                # P好，重复-锦标赛 【去除 for 循环，逻辑化简】
                 print("touched2")
+                visited_rebuttals.add(rebuttal_q_idx)
+
                 best = p_idx
-                for i in range(len(_rebuttal_q_idx)):
-                    visited_rebuttals.add(_rebuttal_q_idx[i])
-                    P = torch.sum(true_u * (D[best] - true_e) ** 2)
-                    Q = torch.sum(true_u * (D[_rebuttal_q_idx[i]] - true_e) ** 2)
-                    total_queries_used += 1
-                    if Q < P:
-                        best = _rebuttal_q_idx[i]
-                        e_prime = _e_prime[i]
-                        u_prime = _u_prime[i]
-                        H.append((_rebuttal_q_idx[i], best))
-                    else:
-                        H.append((best, _rebuttal_q_idx[i]))
-                    # P不是最优，跳转
+                P_dist = torch.sum(true_u * (D[best] - true_e) ** 2)
+                Q_dist = torch.sum(true_u * (D[rebuttal_q_idx] - true_e) ** 2)
+                total_queries_used += 1
+
+                if Q_dist < P_dist:
+                    best = rebuttal_q_idx
+                    H.append((rebuttal_q_idx, best))
+                else:
+                    H.append((best, rebuttal_q_idx))
+
+                # P不是最优，跳转
                 if best != p_idx:
                     e = e_prime
                     u = u_prime
+                    DATA["E-U Route"].append([e.tolist(), u.tolist()])
+                    DATA["Time"].append(time.time() - DATA["Time"][0])
+
                     rounds += 1
                     pbar.update(1)
                 else:
                     print("touched3")
                     final_q, queries, H = at_interactive_binary_search(
-                        D=D,
-                        q_chain=q_chain,
-                        oracle_e=true_e,
-                        oracle_u=true_u,
-                        history_constraints=H
+                        D=D, q_chain=q_chain, oracle_e=true_e, oracle_u=true_u, history_constraints=H
                     )
                     total_queries_used += queries
                     e, u = at_alternating_learning(D, H, e, u, device=device)
+                    DATA["E-U Route"].extend([[e.tolist(), u.tolist()]]* queries)
+
                     rounds += 1
                     pbar.update(1)
 
-
-
-
-    # 超过 max_queries 未能收敛,返回当前结果
-    # print(f"touched:{touched}")
     pbar.close()
     logging.info("touched3")
     return rebuttal_q_idx, rounds, total_queries_used
@@ -561,6 +504,9 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
 
 def main(args):
     global TORCH_DTYPE,  LP_ACC, LP_SAFE, ETA, EPS
+    global DATA
+    DEBUG = True
+    ROUTE_PATH = "4d10kAT_deltaEU"
     EPS = args.eps
     if args.dtype == "float64":
         TORCH_DTYPE = torch.float64
@@ -605,16 +551,29 @@ def main(args):
     for i in range(num_experiments):
         logging.info(f"\n--- 实验 {i + 1}/{num_experiments} ---")
 
+        DATA = {
+            "Best P": [],
+            "E-U Route": [],
+            "True E-U": [],
+            "Time": []
+        }
+
         true_u = dirichlet_dist.sample()
         true_e = E_min + torch.rand(d, device=device) * (E_max - E_min)
+
+        DATA["True E-U"] = [true_e.tolist(), true_e.tolist()]
 
         distance = get_weighted_distance_sq(D, true_e, true_u)
         true_best_idx = torch.argmin(distance).item()
         best_distance = torch.min(distance).item()
         logging.info(f"  [Oracle] 用户的真实最优数据点索引为: {true_best_idx}")
 
+        DATA["Best P"] = D[true_best_idx].tolist()
 
         start_time = time.time()
+
+        DATA["Time"].append(start_time)
+
         at_best_idx, rounds, at_queries = anchor_tracking_algorithm(D, true_e, true_u)
         at_time = time.time() - start_time
         # at_success = (at_best_idx == true_best_idx)
@@ -653,6 +612,11 @@ def main(args):
 
         logging.info(
             f"  [AT 算法] 返回点: {at_best_idx} | 排名: {rank + 1}/{n} | 偏差: {dis_bias:.4f} | 运行次数: {rounds} |提问次数: {at_queries} | 命中: {at_success}")
+
+        DATA["Time"][0] = 0
+        if DEBUG:
+            with open(os.path.join(ROUTE_PATH, f"eu_route_{i}.json"), "w") as f:
+                json.dump(DATA, f)
 
     # 5. 统计报告
     logging.info("\n" + "=" * 40)
