@@ -12,3 +12,5 @@ generator/test
 *.pdf
 *.zip
 *.xlsx
+*.json
+*.log

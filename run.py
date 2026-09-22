@@ -1,8 +1,6 @@
 import argparse
 import AT
-# import AT_EUroute as AT
 import RS
-# import RS_EUroute as RS
 
 def parse_args():
     parser = argparse.ArgumentParser()

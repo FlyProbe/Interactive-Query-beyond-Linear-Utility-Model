@@ -282,6 +282,10 @@ def at_alternating_learning(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     【步骤 5】基于最新的历史偏好约束 H，通过计算似然函数与回溯线搜索，交替优化锚点。
+    修改点：
+    1. 恢复 is_valid 的硬拦截，严格保证锚点不越出可行域。
+    2. 将梯度计算由 sum 改为 mean，解耦梯度尺度与 H 的大小。
+    3. 放宽免检期并收紧早停容差，榨干边界下降空间。
     """
     e, u = current_e.clone(), current_u.clone()
 
@@ -303,7 +307,6 @@ def at_alternating_learning(
         delta = dist_P - dist_Q
 
         # 1. 计算 Likelihood = sum(log(1 + exp(g(p) - g(q))))
-        # 使用 softplus 保证数值稳定性，避免 delta 过大时出现 NaN
         L = torch.sum(F.softplus(delta)).item()
 
         # 2. 校验所有的历史偏好是否绝对满足 (期望 delta < 0)
@@ -323,10 +326,9 @@ def at_alternating_learning(
         term_q_u = (Q - e) ** 2
         delta_u = torch.sum(u * term_p_u, dim=-1) - torch.sum(u * term_q_u, dim=-1)
 
-        # L 对 delta 的偏导数是 sigmoid
         sig_u = torch.sigmoid(delta_u).unsqueeze(-1)
-        # 链式法则：将 Likelihood 对 u 求偏导
-        grad_u = torch.sum(sig_u * (term_p_u - term_q_u), dim=0)
+
+        grad_u = torch.mean(sig_u * (term_p_u - term_q_u), dim=0)
 
         lr = init_lr
 
@@ -334,17 +336,16 @@ def at_alternating_learning(
             u_next = torch.clamp(u - lr * grad_u, 0.001, 1.0)
             u_next = u_next / torch.sum(u_next)
 
-            # 计算更新后的 Likelihood 和合法性
             L_next, is_valid = compute_likelihood_and_constraints(e, u_next)
 
-            # 退火核心：只有当 Likelihood 真实下降，且满足约束时，才接受更新！
-            if L_next < L_prev:
+            # 严格遵守 Bradley-Terry 模型要求锚点解释所有历史反馈的前提
+            if L_next < L_prev and is_valid:
                 u = u_next
                 break
             # 否则，学习率砍半，重新试探
             lr *= 0.5
 
-            # ------------------------------------------------
+        # ------------------------------------------------
         # 2. 固定 u，计算 Likelihood 偏导并退火更新 e
         # ------------------------------------------------
         L_prev, _ = compute_likelihood_and_constraints(e, u)
@@ -352,8 +353,7 @@ def at_alternating_learning(
         delta_e = torch.sum(u * (P - e) ** 2, dim=-1) - torch.sum(u * (Q - e) ** 2, dim=-1)
         sig_e = torch.sigmoid(delta_e).unsqueeze(-1)
 
-        # 链式法则：将 Likelihood 对 e 求偏导 (化简后为 2*u*(Q-P))
-        grad_e = torch.sum(sig_e * (2 * u * (Q - P)), dim=0)
+        grad_e = torch.mean(sig_e * (2 * u * (Q - P)), dim=0)
 
         lr = init_lr
         while lr > 1e-5:
@@ -361,18 +361,14 @@ def at_alternating_learning(
 
             L_next, is_valid = compute_likelihood_and_constraints(e_next, u)
 
-            if L_next < L_prev:
+            if L_next < L_prev and is_valid:
                 e = e_next
                 break
             lr *= 0.5
-        # print("After +++++++++++++++++++++++++++++++++++++")
-        # print(f"e:{e}, u:{u}")
-        # print("============== END OF ROUND =================")
-            # 极小幅度早停判定
-        if i > 20 and torch.linalg.norm(e - e_prev) < 1e-4 and torch.linalg.norm(u - u_prev) < 1e-4:
-            # print(f"============== BREAK AT {i} =================")
-            break
 
+        # 给予均值化梯度更长的探索窗口，逼迫算法利用极微小的合法梯度贴墙滑动
+        if i > 50 and torch.linalg.norm(e - e_prev) < 1e-5 and torch.linalg.norm(u - u_prev) < 1e-5:
+            break
 
 
     return e, u
