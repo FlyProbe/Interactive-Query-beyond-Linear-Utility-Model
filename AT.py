@@ -17,6 +17,35 @@ from typing import List, Tuple, Any, Optional
 
 from utils import *
 
+class ComparisonCache:
+    """Reuse exact deterministic answers; keep the baseline search and H unchanged."""
+
+    def __init__(self, D, oracle_e, oracle_u):
+        self.D, self.e, self.u = D, oracle_e, oracle_u
+        self.answers = {}
+        self.events = []
+        self.queries_used = 0
+
+    def compare(self, left, right, source):
+        key = (min(left, right), max(left, right))
+        cached = key in self.answers
+        if left == right:
+            outcome, cost = 0, 0
+        elif cached:
+            outcome, cost = self.answers[key], 0
+        else:
+            a = torch.sum(self.u * (self.D[key[0]] - self.e) ** 2)
+            b = torch.sum(self.u * (self.D[key[1]] - self.e) ** 2)
+            outcome = -1 if a < b else (1 if b < a else 0)
+            self.answers[key] = outcome
+            self.queries_used += 1
+            cost = 1
+            DATA["Time"].append(time.time() - DATA["Time"][0])
+        prefers_left = outcome == (-1 if left == key[0] else 1)
+        self.events.append(dict(left=left, right=right, source=source,
+                                cached=cached, cost=cost, prefers_left=prefers_left))
+        return prefers_left, cost
+
 def at_find_nearest_neighbor(D: torch.Tensor, e: torch.Tensor, u: torch.Tensor) -> Tuple[int, torch.Tensor]:
     """
     【步骤 2】根据当前的锚点 (e, u) 在数据集 D 中找到加权距离平方最小的最近邻点 p
@@ -213,7 +242,8 @@ def at_interactive_binary_search(
         q_chain: List[int],
         oracle_e: torch.Tensor,
         oracle_u: torch.Tensor,
-        history_constraints: List[Tuple[int, int]]
+        history_constraints: List[Tuple[int, int]],
+        comparison_cache: ComparisonCache
 ) -> Tuple[int, int, List[Tuple[int, int]]]:
     """
     【步骤 4】对单调路径 q_chain 进行二分查找，通过模拟用户交互收集偏好约束 H。
@@ -242,12 +272,8 @@ def at_interactive_binary_search(
         # 模拟用户判断 (Oracle)
         # 真实场景下，这里应替换为向用户前端发送问题并等待接收点击反馈
         # ----------------------------------------------------
-        dist_left = torch.sum(oracle_u * (D[p_left] - oracle_e) ** 2)
-        dist_right = torch.sum(oracle_u * (D[p_right] - oracle_e) ** 2)
-        user_prefers_left = dist_left < dist_right
-
-        queries_used += 1
-        DATA["Time"].append(time.time() - DATA["Time"][0])
+        user_prefers_left, cost = comparison_cache.compare(p_left, p_right, "chain")
+        queries_used += cost
 
 
         # ----------------------------------------------------
@@ -385,6 +411,10 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
     dirichlet_dist = torch.distributions.Dirichlet(torch.ones(d, device=device))
     u = dirichlet_dist.sample()
 
+    DATA["Initial E-U"] = [e.tolist(), u.tolist()]
+    comparison_cache = ComparisonCache(D, true_e, true_u)
+    DATA["Comparisons"] = comparison_cache.events
+
     H = []
     total_queries_used = 0
     rounds = 0
@@ -416,10 +446,8 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
             D=D, e=e, u=u, e_prime=e_prime, u_prime=u_prime, vary_u=vary_u
         )
 
-        p = torch.sum(true_u * (D[p_idx] - true_e) ** 2)
-        q = torch.sum(true_u * (D[rebuttal_q_idx] - true_e) ** 2)
-        user_prefers_p = p < q
-        total_queries_used += 1
+        user_prefers_p, cost = comparison_cache.compare(p_idx, rebuttal_q_idx, "rebuttal")
+        total_queries_used += cost
 
         if not user_prefers_p:
             # P不好-跳转
@@ -431,7 +459,6 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
             e = e_prime
             u = u_prime
             DATA["E-U Route"].append([e.tolist(), u.tolist()])
-            DATA["Time"].append(time.time() - DATA["Time"][0])
             rounds += 1
             pbar.update(1)
         else:
@@ -446,7 +473,8 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
                 previous_qchain = q_chain
 
                 final_q, queries, H = at_interactive_binary_search(
-                    D=D, q_chain=q_chain, oracle_e=true_e, oracle_u=true_u, history_constraints=H
+                    D=D, q_chain=q_chain, oracle_e=true_e, oracle_u=true_u, history_constraints=H,
+                    comparison_cache=comparison_cache
                 )
                 total_queries_used += queries
                 e, u = at_alternating_learning(D, H, e, u, device=device)
@@ -461,11 +489,10 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
                 visited_rebuttals.add(rebuttal_q_idx)
 
                 best = p_idx
-                P_dist = torch.sum(true_u * (D[best] - true_e) ** 2)
-                Q_dist = torch.sum(true_u * (D[rebuttal_q_idx] - true_e) ** 2)
-                total_queries_used += 1
+                prefers_q, cost = comparison_cache.compare(rebuttal_q_idx, best, "fallback")
+                total_queries_used += cost
 
-                if Q_dist < P_dist:
+                if prefers_q:
                     best = rebuttal_q_idx
                     H.append((rebuttal_q_idx, best))
                 else:
@@ -476,14 +503,14 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
                     e = e_prime
                     u = u_prime
                     DATA["E-U Route"].append([e.tolist(), u.tolist()])
-                    DATA["Time"].append(time.time() - DATA["Time"][0])
 
                     rounds += 1
                     pbar.update(1)
                 else:
                     print("touched3")
                     final_q, queries, H = at_interactive_binary_search(
-                        D=D, q_chain=q_chain, oracle_e=true_e, oracle_u=true_u, history_constraints=H
+                        D=D, q_chain=q_chain, oracle_e=true_e, oracle_u=true_u, history_constraints=H,
+                        comparison_cache=comparison_cache
                     )
                     total_queries_used += queries
                     e, u = at_alternating_learning(D, H, e, u, device=device)
@@ -502,7 +529,8 @@ def main(args):
     global TORCH_DTYPE,  LP_ACC, LP_SAFE, ETA, EPS
     global DATA
     DEBUG = True
-    ROUTE_PATH = "4d10kAT_deltaEU"
+    ROUTE_PATH = "experiments/A/routes"
+    os.makedirs(ROUTE_PATH, exist_ok=True)
     EPS = args.eps
     if args.dtype == "float64":
         TORCH_DTYPE = torch.float64
@@ -557,7 +585,10 @@ def main(args):
         true_u = dirichlet_dist.sample()
         true_e = E_min + torch.rand(d, device=device) * (E_max - E_min)
 
-        DATA["True E-U"] = [true_e.tolist(), true_e.tolist()]
+        DATA["True E-U"] = [true_e.tolist(), true_u.tolist()]
+        DATA["RNG before anchor"] = torch.get_rng_state().tolist()
+        if device.type == "cuda":
+            DATA["CUDA RNG before anchor"] = torch.cuda.get_rng_state().tolist()
 
         distance = get_weighted_distance_sq(D, true_e, true_u)
         true_best_idx = torch.argmin(distance).item()
@@ -605,6 +636,13 @@ def main(args):
             'dis_bias': dis_bias,
             'rank': rank
         })
+        events = DATA["Comparisons"]
+        assert at_queries == sum(event["cost"] for event in events)
+        at_results[-1].update(rounds=rounds, comparison_requests=len(events),
+                              cache_hits=sum(event["cached"] for event in events))
+        DATA["Result"] = at_results[-1]
+        logging.info("[A cache] requests=%d actual=%d hits=%d", len(events), at_queries,
+                     at_results[-1]["cache_hits"])
 
         logging.info(
             f"  [AT 算法] 返回点: {at_best_idx} | 排名: {rank + 1}/{n} | 偏差: {dis_bias:.4f} | 运行次数: {rounds} |提问次数: {at_queries} | 命中: {at_success}")
@@ -638,7 +676,8 @@ def main(args):
     logging.info(f"[Anchor Tracking] 平均排位: {at_rank:.1f}/{n}")
     logging.info(f"[Anchor Tracking] 平均偏差: {at_bias:.4f}")
     logging.info(f"[Anchor Tracking] 平均提问次数: {at_avg_queries:.1f}")
-    logging.info(f"[Anchor Tracking] 平均耗时: {at_avg_time:.4f} 秒")
+    with open("experiments/A/results.json", "w", encoding="utf-8") as f:
+        json.dump({"args": vars(args), "results": at_results}, f, indent=2)
     logging.info(f"[Anchor Tracking] 失败次数: {at_fail}/{num_experiments}")
 
 
