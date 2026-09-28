@@ -32,7 +32,7 @@ def setup_logging():
         ],
         force=True
     )
-    logging.info(f"日志文件已创建: {log_filename}")
+    logging.info("Log file created: %s", log_filename)
 
 def get_weighted_distance_sq(D, e, u):
     """计算数据集 D 中所有点到期望点 e 的加权距离平方 (支持多维广播)"""
@@ -65,5 +65,5 @@ def load_dataset(filepath):
 
         return D_normalized
     except Exception as e:
-        print(f"数据加载失败，请检查文件路径和格式。错误: {e}")
+        print(f"Failed to load dataset; check the path and file format. Error: {e}")
         return None

@@ -1,24 +1,54 @@
-import numpy as np
-import time
-import scipy
-import random
-import os
-import logging
-from datetime import datetime
-from scipy.optimize import linprog
-import warnings
-import torch  # 引入 PyTorch
-import torch.nn.functional as F
-from tqdm import tqdm
-import time
+"""Anchor tracking with candidate information gain (the selected ACIG strategy).
+
+Select one unseen question, update the anchor, then replan both chains.
+Information gain scores questions only; the stopping decision uses the LP.
+DATA keeps the existing monitoring schema. Each Time / E-U Route entry is
+recorded after one paid question and its anchor update; cached answers add none.
+"""
 import json
+import logging
+import time
+from dataclasses import dataclass, replace
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Tuple
 
-from typing import List, Tuple, Any, Optional
+import numpy as np
+from scipy.optimize import linprog
 
-from utils import *
+
+def _initialize_highs_before_torch():
+    # Initialize HiGHS first to avoid the Windows numerical-runtime conflict.
+    linprog(np.array([1.0]), A_ub=np.array([[-1.0]]), b_ub=np.array([0.0]),
+            bounds=[(0, 1)], method="highs")
+
+
+_initialize_highs_before_torch()
+
+import torch
+import torch.nn.functional as F
+
+from utils import get_weighted_distance_sq, load_dataset, setup_logging
+
+
+DATA = {"Best P": [], "E-U Route": [], "True E-U": [], "Time": []}
+
+
+def configure(dtype="float32"):
+    """Configure the tensor dtype and matching numerical tolerances."""
+    global TORCH_DTYPE, LP_ACC, LP_SAFE, ETA
+    if dtype not in ("float32", "float64"):
+        raise ValueError("dtype must be float32 or float64")
+    TORCH_DTYPE = torch.float64 if dtype == "float64" else torch.float32
+    LP_ACC, LP_SAFE, ETA = (
+        (1e-8, 1e-9, 1e-10) if dtype == "float64" else (1e-6, 1e-7, 1e-7))
+
+
+configure()
+
 
 class ComparisonCache:
-    """Reuse exact deterministic answers; keep the baseline search and H unchanged."""
+    """Reuse exact deterministic answers and count only previously unseen pairs."""
 
     def __init__(self, D, oracle_e, oracle_u):
         self.D, self.e, self.u = D, oracle_e, oracle_u
@@ -40,38 +70,22 @@ class ComparisonCache:
             self.answers[key] = outcome
             self.queries_used += 1
             cost = 1
-            DATA["Time"].append(time.time() - DATA["Time"][0])
         prefers_left = outcome == (-1 if left == key[0] else 1)
         self.events.append(dict(left=left, right=right, source=source,
                                 cached=cached, cost=cost, prefers_left=prefers_left))
         return prefers_left, cost
 
+
 def at_find_nearest_neighbor(D: torch.Tensor, e: torch.Tensor, u: torch.Tensor) -> Tuple[int, torch.Tensor]:
-    """
-    【步骤 2】根据当前的锚点 (e, u) 在数据集 D 中找到加权距离平方最小的最近邻点 p
-
-    参数:
-        D (torch.Tensor): 核心候选数据集，形状为 (N, d)
-        e (torch.Tensor): 当前期望中心向量，形状为 (d,)
-        u (torch.Tensor): 当前属性权重向量，形状为 (d,)
-
-    返回:
-        p_idx (int): 最近邻点在数据集中的索引
-        p_val (torch.Tensor): 最近邻点的具体属性向量，形状为 (d,)
-    """
-    # 核心张量加速区：利用广播机制计算所有点到 e 的距离
-    # D - e: 将形状 (d,) 的 e 广播到 (N, d) 的 D 上，同时计算每个维度的差值
-    # u * (...): 将形状 (d,) 的 u 广播到 (N, d) 的差值平方上进行逐元素权重相乘
-    # torch.sum(..., dim=-1): 在最后一个维度 (维度 d) 上求和，得到形状为 (N,) 的距离向量
+    """Return the nearest item under the current weighted squared distance."""
     distances = torch.sum(u * (D - e) ** 2, dim=-1)
 
-    # 提取最小值对应的索引
     p_idx = torch.argmin(distances).item()
 
-    # 获取具体的点向量
     p_val = D[p_idx]
 
     return p_idx, p_val
+
 
 def at_check_stopping_condition_LP(
         history_constraints: List[Tuple[int, int]],
@@ -82,17 +96,11 @@ def at_check_stopping_condition_LP(
         visited_rebuttals: set,
         device: str = "cpu"
 ) -> Tuple[Optional[int], Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """
-    【附加控制步】利用线性规划(LP)检查当前最优解 p 是否满足终止条件。
-    如果不满足，则找出【第一个】反驳点 q（按距离由近及远），并返回。
-    去除了冗余的 List 列表包装，直接返回单个反驳点及参数。
-    """
-    n, d = D.shape
+    """Return the first feasible challenger and its anchor, or certify LP termination."""
+    _, d = D.shape
     p_star = D[p_idx]
 
-    E_max = torch.max(D, dim=0)[0]
-
-    # --- 1. GPU 内核矩阵化预组装约束 ---
+    # Lift feedback to linear constraints in (u, z), where z = u * e.
     if len(history_constraints) > 0:
         winners = torch.tensor([h[0] for h in history_constraints], dtype=torch.long, device=device)
         losers = torch.tensor([h[1] for h in history_constraints], dtype=torch.long, device=device)
@@ -122,7 +130,6 @@ def at_check_stopping_condition_LP(
     E_max_val = torch.max(D).item()
     bounds = [(0, 1)] * d + [(0, E_max_val)] * d
 
-    # --- 2. 智能排序与极速早停 (Lazy Evaluation) ---
     D_np = D.cpu().numpy()
     p_star_np = p_star.cpu().numpy()
 
@@ -151,7 +158,6 @@ def at_check_stopping_condition_LP(
             u_prime_tensor = torch.tensor(u_prime, dtype=TORCH_DTYPE, device=device)
             e_prime_tensor = torch.tensor(e_prime, dtype=TORCH_DTYPE, device=device)
 
-            # 【去除 List，直接触发早停并返回单一结果】
             return q_idx, e_prime_tensor, u_prime_tensor
 
     return None, None, None
@@ -160,16 +166,9 @@ def at_check_stopping_condition_LP(
 def at_construct_q_chain_alternating(D: torch.Tensor, e: torch.Tensor, u: torch.Tensor,
                                      e_prime: torch.Tensor, u_prime: torch.Tensor,
                                      vary_u: bool):
-    """
-    【步骤 3】支持交替策略的下包络线（Lower Envelope）算法构造单调最近点路径。
-
-    参数:
-        vary_u (bool): True 表示变动 u 固定 e；False 表示变动 e 固定 u。
-    """
+    """Build a lower-envelope chain by varying weights or the ideal point."""
     if vary_u:
-        # ---------------------------------------------------------
-        # 模式 1：固定 e_prime，变动 u (u + eta * delta_u)
-        # ---------------------------------------------------------
+        # Fix the rebuttal ideal point and vary the weights.
         delta_u = u_prime - u
         # A_p = \sum u_i (p_i - e_prime_i)^2
         A = torch.sum(u * (D - e_prime) ** 2, dim=-1)
@@ -201,14 +200,11 @@ def at_construct_q_chain_alternating(D: torch.Tensor, e: torch.Tensor, u: torch.
             q_chain_eu.append((e_prime, u + eta_intersections[next_p] * delta_u))
 
     else:
-        # ---------------------------------------------------------
-        # 模式 2：固定 u_prime，变动 e (e + eta * delta_e)
-        # ---------------------------------------------------------
+        # Fix the rebuttal weights and vary the ideal point.
         delta_e = e_prime - e
         # A_p = \sum u_prime_i (p_i - e_i)^2
         A = torch.sum(u_prime * (D - e) ** 2, dim=-1)
-        # B_p = -2 * \sum u_prime_i (p_i - e_i) * \Delta e_i
-        # 注意：此处二阶项 eta^2 在求交点差值时已抵消，所以斜率 B 仅保留一阶交叉项
+        # Point-independent terms cancel when comparing intersections.
         B = -2.0 * torch.sum(u_prime * D * delta_e, dim=-1)
 
         curr_p = torch.argmin(A).item()
@@ -237,65 +233,6 @@ def at_construct_q_chain_alternating(D: torch.Tensor, e: torch.Tensor, u: torch.
 
     return q_chain, q_chain_eu
 
-def at_interactive_binary_search(
-        D: torch.Tensor,
-        q_chain: List[int],
-        oracle_e: torch.Tensor,
-        oracle_u: torch.Tensor,
-        history_constraints: List[Tuple[int, int]],
-        comparison_cache: ComparisonCache
-) -> Tuple[int, int, List[Tuple[int, int]]]:
-    """
-    【步骤 4】对单调路径 q_chain 进行二分查找，通过模拟用户交互收集偏好约束 H。
-
-    参数:
-        D (torch.Tensor): 数据集 (N, d)
-        q_chain (List[int]): 步骤 3 提取的单调最近点路径
-        oracle_e, oracle_u: 用户的真实偏好（用于模拟真实用户的判断）
-        history_constraints: 历史约束集合 H
-
-    返回:
-        final_q_idx (int): 沿这条射线二分查找最终收敛的那个用户最喜欢的点
-        queries_used (int): 本轮查找消耗的提问次数
-        history_constraints (List): 追加了本轮新约束的 H 集合
-    """
-    queries_used = 0
-
-    # 当链条中剩余多于 1 个候选点时，持续进行二分查找
-    while len(q_chain) > 1:
-        # 寻找最中间的两个相邻候选点
-        mid = len(q_chain) // 2
-        p_left = q_chain[mid - 1]
-        p_right = q_chain[mid]
-
-        # ----------------------------------------------------
-        # 模拟用户判断 (Oracle)
-        # 真实场景下，这里应替换为向用户前端发送问题并等待接收点击反馈
-        # ----------------------------------------------------
-        user_prefers_left, cost = comparison_cache.compare(p_left, p_right, "chain")
-        queries_used += cost
-
-
-        # ----------------------------------------------------
-        # 二分剪枝与约束收集
-        # ----------------------------------------------------
-        if user_prefers_left:
-            # 用户觉得左边的点更好，说明真实理想点对应的 eta 必定 <= 临界点
-            # 右半部分的链条永远不可能是最优解，整体剪裁掉
-            history_constraints.append((p_left, p_right))
-            q_chain = q_chain[:mid]
-        else:
-            # 用户觉得右边的点更好，说明真实理想点对应的 eta 必定 >= 临界点
-            # 左半部分的链条被淘汰，整体剪裁掉
-            history_constraints.append((p_right, p_left))
-            q_chain = q_chain[mid:]
-
-    # 最终链条必定会收束到唯一一个点（局部最优解）
-    final_q_idx = q_chain[0] if len(q_chain) > 0 else -1
-    # ==
-
-    return final_q_idx, queries_used, history_constraints
-
 
 def at_alternating_learning(
         D: torch.Tensor,
@@ -306,13 +243,7 @@ def at_alternating_learning(
         init_lr: float = 0.5,
         device: str = "cpu"
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    【步骤 5】基于最新的历史偏好约束 H，通过计算似然函数与回溯线搜索，交替优化锚点。
-    修改点：
-    1. 恢复 is_valid 的硬拦截，严格保证锚点不越出可行域。
-    2. 将梯度计算由 sum 改为 mean，解耦梯度尺度与 H 的大小。
-    3. 放宽免检期并收紧早停容差，榨干边界下降空间。
-    """
+    """Alternate feasible likelihood descent in weights and the ideal point."""
     e, u = current_e.clone(), current_u.clone()
 
     if len(history_constraints) == 0:
@@ -327,15 +258,13 @@ def at_alternating_learning(
     Q = D[q_indices]
 
     def compute_likelihood_and_constraints(e_test: torch.Tensor, u_test: torch.Tensor) -> Tuple[float, bool]:
-        """核心组件：计算当前参数的 Likelihood (负对数似然) 以及是否满足 H 约束"""
+        """Return the negative log-likelihood and strict feedback feasibility."""
         dist_P = torch.sum(u_test * (P - e_test) ** 2, dim=-1)
         dist_Q = torch.sum(u_test * (Q - e_test) ** 2, dim=-1)
         delta = dist_P - dist_Q
 
-        # 1. 计算 Likelihood = sum(log(1 + exp(g(p) - g(q))))
         L = torch.sum(F.softplus(delta)).item()
 
-        # 2. 校验所有的历史偏好是否绝对满足 (期望 delta < 0)
         is_valid = torch.all(delta < 0).item()
 
         return L, is_valid
@@ -343,9 +272,7 @@ def at_alternating_learning(
     for i in range(max_iter):
         e_prev, u_prev = e.clone(), u.clone()
 
-        # ------------------------------------------------
-        # 1. 固定 e，计算 Likelihood 偏导并退火更新 u
-        # ------------------------------------------------
+        # Update weights using backtracking while preserving all feedback.
         L_prev, _ = compute_likelihood_and_constraints(e, u)
 
         term_p_u = (P - e) ** 2
@@ -364,16 +291,13 @@ def at_alternating_learning(
 
             L_next, is_valid = compute_likelihood_and_constraints(e, u_next)
 
-            # 严格遵守 Bradley-Terry 模型要求锚点解释所有历史反馈的前提
             if L_next < L_prev and is_valid:
                 u = u_next
                 break
-            # 否则，学习率砍半，重新试探
+
             lr *= 0.5
 
-        # ------------------------------------------------
-        # 2. 固定 u，计算 Likelihood 偏导并退火更新 e
-        # ------------------------------------------------
+        # Update the ideal point with the accepted weights held fixed.
         L_prev, _ = compute_likelihood_and_constraints(e, u)
 
         delta_e = torch.sum(u * (P - e) ** 2, dim=-1) - torch.sum(u * (Q - e) ** 2, dim=-1)
@@ -392,295 +316,422 @@ def at_alternating_learning(
                 break
             lr *= 0.5
 
-        # 给予均值化梯度更长的探索窗口，逼迫算法利用极微小的合法梯度贴墙滑动
         if i > 50 and torch.linalg.norm(e - e_prev) < 1e-5 and torch.linalg.norm(u - u_prev) < 1e-5:
             break
-
-
     return e, u
 
 
-def anchor_tracking_algorithm(D, true_e, true_u, max_round=500):
-    device = D.device
-    d = D.shape[1]
+def row_dots(rows, vector):
+    # Small 2d-wide rows: avoid NumPy BLAS starting a second OpenMP runtime
+    # alongside PyTorch on the existing Anaconda/Windows installation.
+    return np.sum(rows*vector, axis=1)
 
-    E_min = torch.min(D, dim=0)[0]
-    E_max = torch.max(D, dim=0)[0]
-    e = E_min + torch.rand(d, device=device) * (E_max - E_min)
 
-    dirichlet_dist = torch.distributions.Dirichlet(torch.ones(d, device=device))
-    u = dirichlet_dist.sample()
+def sample_gaps(samples, rows):
+    return np.einsum("si,hi->sh", samples, rows, optimize=False)
 
-    DATA["Initial E-U"] = [e.tolist(), u.tolist()]
-    comparison_cache = ComparisonCache(D, true_e, true_u)
-    DATA["Comparisons"] = comparison_cache.events
 
-    H = []
-    total_queries_used = 0
-    rounds = 0
+@dataclass(frozen=True)
+class SelectionConfig:
+    samples: int = 256
+    burn_in: int = 64
+    thinning: int = 2
+    seed: int = 20260924
+    tolerance: float = 1e-9
 
-    visited_rebuttals = set()
-    previous_p_idx = -1
-    previous_e = e
-    previous_u = u
-    previous_qchain = []
+    def __post_init__(self):
+        if self.samples < 2 or self.burn_in < 0 or self.thinning < 1 or self.tolerance <= 0:
+            raise ValueError("Invalid sampling configuration")
 
-    pbar = tqdm(total=max_round)
-    while rounds < max_round:
 
-        p_idx, p_val = at_find_nearest_neighbor(D, e, u)
+def candidate_pairs(u_chain, e_chain, incumbent, rebuttal, answered):
+    """Union of unseen adjacent pairs from both alternating chains and the rebuttal pair."""
+    candidates = {}
+    for source, pairs in (
+        ("rebuttal", [(incumbent, rebuttal)]),
+        ("u_chain", zip(u_chain, u_chain[1:])),
+        ("e_chain", zip(e_chain, e_chain[1:])),
+    ):
+        for left, right in pairs:
+            key = tuple(sorted((int(left), int(right))))
+            if key[0] == key[1] or key in answered:
+                continue
+            candidates.setdefault(key, []).append(source)
+    return candidates
 
-        # 【直接接收单一返回值】
-        rebuttal_q_idx, e_prime, u_prime = at_check_stopping_condition_LP(H, D, p_idx, e, u, visited_rebuttals,
-                                                                          device=device)
 
-        # 判定是否收敛
-        if rebuttal_q_idx is None:
-            logging.info("Ending-LP")
-            pbar.close()
-            return p_idx, rounds, total_queries_used
+def balanced_pair(points, samples, candidates, tolerance=1e-9):
+    """Maximize empirical answer disagreement, NOT best-item information gain.
 
-        vary_u = (rounds % 2 == 0)
+    Near-ties abstain, so a degenerate all-tie cloud cannot appear informative.
+    If the cloud is unavailable/uninformative, prefer the unseen rebuttal pair.
+    """
+    if not candidates:
+        return None, {"reason": "no_unasked_pair"}
+    ranked = []
+    for pair, sources in candidates.items():
+        left, right = points[list(pair)]
+        row = np.r_[left*left-right*right, -2*(left-right)]
+        norm = np.sqrt(np.sum(row*row))
+        gaps = row_dots(samples,row/max(norm, 1e-15)) if len(samples) else np.empty(0)
+        negative, positive = int((gaps < -tolerance).sum()), int((gaps > tolerance).sum())
+        score = min(negative, positive)/len(samples) if len(samples) else 0.
+        ties = len(samples)-negative-positive
+        probability = (negative+.5*ties)/len(samples) if len(samples) else None
+        ranked.append((score, int("rebuttal" in sources), pair,
+                       dict(score=score, left_probability=probability, sources=sources,
+                            samples=len(samples), abstentions=ties)))
+    # Deterministic tie break; no oracle or anchor-distance lookahead.
+    ranked.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    score, _, pair, info = ranked[0]
+    info["reason"] = "balanced_split" if score > 0 else "uninformative_fallback"
+    return pair, info
 
-        q_chain, q_chain_eu = at_construct_q_chain_alternating(
-            D=D, e=e, u=u, e_prime=e_prime, u_prime=u_prime, vary_u=vary_u
-        )
 
-        user_prefers_p, cost = comparison_cache.compare(p_idx, rebuttal_q_idx, "rebuttal")
-        total_queries_used += cost
+class FeasibleSamples:
+    """Hit-and-run proxy ensemble in the lifted feedback polytope.
 
-        if not user_prefers_p:
-            # P不好-跳转
-            if (rebuttal_q_idx, p_idx) in H:
-                visited_rebuttals.add(p_idx)
-            else:
-                H.append((rebuttal_q_idx, p_idx))
+    Sampling in (u,z) is used only for query scoring.
+    It approximates uniform lifted-space volume, not a posterior for the
+    original uniform-e/Dirichlet-u prior. Finite-chain mixing is not certified.
+    """
+    def __init__(self, points, config=SelectionConfig()):
+        self.points = np.asarray(points, dtype=np.float64)
+        self.config = config
+        self.rng = np.random.default_rng(config.seed)  # independent of torch/oracle RNG
+        self.samples = np.empty((0, 2*self.points.shape[1]))
+        self.last_status = "not_sampled"
 
-            e = e_prime
-            u = u_prime
-            DATA["E-U Route"].append([e.tolist(), u.tolist()])
-            rounds += 1
-            pbar.update(1)
+    def inequalities(self, history):
+        d = self.points.shape[1]
+        I, Z = np.eye(d), np.zeros((d,d))
+        A = np.vstack((np.c_[-I,Z], np.c_[Z,-I], np.c_[-I,I]))
+        if history:
+            winners, losers = np.asarray(history, dtype=int).T
+            p, q = self.points[winners], self.points[losers]
+            feedback = np.c_[p*p-q*q, -2*(p-q)]
+            norms = np.linalg.norm(feedback, axis=1)
+            A = np.vstack((A, feedback[norms>0]/norms[norms>0,None]))
+        return A
+
+    def draw(self, history):
+        d, config = self.points.shape[1], self.config
+        A = self.inequalities(history)
+        if len(self.samples):
+            survivors = self.samples[np.all(sample_gaps(self.samples,A) <= config.tolerance, axis=1)]
         else:
-            # P好-不重复-走后续流程
-            H.append((p_idx, rebuttal_q_idx))
-            if q_chain != previous_qchain or p_idx != previous_p_idx or (not torch.equal(e, previous_e)) or (
-            not torch.equal(u, previous_u)):
-                visited_rebuttals.clear()
-                previous_p_idx = p_idx
-                previous_e = e
-                previous_u = u
-                previous_qchain = q_chain
-
-                final_q, queries, H = at_interactive_binary_search(
-                    D=D, q_chain=q_chain, oracle_e=true_e, oracle_u=true_u, history_constraints=H,
-                    comparison_cache=comparison_cache
-                )
-                total_queries_used += queries
-                e, u = at_alternating_learning(D, H, e, u, device=device)
-                DATA["E-U Route"].extend([[e.tolist(), u.tolist()]]* queries)
-
-
-                rounds += 1
-                pbar.update(1)
-            else:
-                # P好，重复-锦标赛 【去除 for 循环，逻辑化简】
-                print("touched2")
-                visited_rebuttals.add(rebuttal_q_idx)
-
-                best = p_idx
-                prefers_q, cost = comparison_cache.compare(rebuttal_q_idx, best, "fallback")
-                total_queries_used += cost
-
-                if prefers_q:
-                    best = rebuttal_q_idx
-                    H.append((rebuttal_q_idx, best))
-                else:
-                    H.append((best, rebuttal_q_idx))
-
-                # P不是最优，跳转
-                if best != p_idx:
-                    e = e_prime
-                    u = u_prime
-                    DATA["E-U Route"].append([e.tolist(), u.tolist()])
-
-                    rounds += 1
-                    pbar.update(1)
-                else:
-                    print("touched3")
-                    final_q, queries, H = at_interactive_binary_search(
-                        D=D, q_chain=q_chain, oracle_e=true_e, oracle_u=true_u, history_constraints=H,
-                        comparison_cache=comparison_cache
-                    )
-                    total_queries_used += queries
-                    e, u = at_alternating_learning(D, H, e, u, device=device)
-                    DATA["E-U Route"].extend([[e.tolist(), u.tolist()]]* queries)
-
-                    rounds += 1
-                    pbar.update(1)
-
-    pbar.close()
-    logging.info("touched3")
-    return rebuttal_q_idx, rounds, total_queries_used
-
-
-
-def main(args):
-    global TORCH_DTYPE,  LP_ACC, LP_SAFE, ETA, EPS
-    global DATA
-    DEBUG = True
-    ROUTE_PATH = "experiments/A/routes"
-    os.makedirs(ROUTE_PATH, exist_ok=True)
-    EPS = args.eps
-    if args.dtype == "float64":
-        TORCH_DTYPE = torch.float64
-        LP_ACC = 1e-08
-        LP_SAFE = 1e-09
-        ETA = 1e-10
-    else: # Default is float32. For 2D dataset, should be torch.float64 to ensure 100% accuracy
-        TORCH_DTYPE = torch.float32
-        LP_ACC = 1e-06
-        LP_SAFE = 1e-07
-        ETA = 1e-07
-
-    setup_logging()  # 初始化日志    
-    filepath = args.data
-    D_np = load_dataset(filepath)
-    if D_np is None:
-        Exception("Wrong dataset path.")
-
-    if args.data_size < len(D_np):
-        D_np = D_np[:args.data_size]
-
-    num_experiments = args.rounds
-
-    # 自动识别并配置 GPU / CPU 设备
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logging.info(f"数据集: {filepath}")
-    logging.info(f"当前运行设备: {device}")
-
-    # 将数据集加载为 PyTorch Tensor 并推送至指定设备
-    D = torch.tensor(D_np, dtype=TORCH_DTYPE, device=device)
-    n, d = D.shape
-    logging.info(f"成功加载数据集: {n} 条数据, {d} 个维度。")
-
-    E_min = torch.min(D, dim=0)[0]
-    E_max = torch.max(D, dim=0)[0]
-
-    rs_results, at_results = [], []
-    dirichlet_dist = torch.distributions.Dirichlet(torch.ones(d, device=device))
-
-    logging.info(f"开始执行 {num_experiments} 次对比实验...")
-
-    for i in range(num_experiments):
-        logging.info(f"\n--- 实验 {i + 1}/{num_experiments} ---")
-
-        DATA = {
-            "Best P": [],
-            "E-U Route": [],
-            "True E-U": [],
-            "Time": []
-        }
-
-        true_u = dirichlet_dist.sample()
-        true_e = E_min + torch.rand(d, device=device) * (E_max - E_min)
-
-        DATA["True E-U"] = [true_e.tolist(), true_u.tolist()]
-        DATA["RNG before anchor"] = torch.get_rng_state().tolist()
-        if device.type == "cuda":
-            DATA["CUDA RNG before anchor"] = torch.cuda.get_rng_state().tolist()
-
-        distance = get_weighted_distance_sq(D, true_e, true_u)
-        true_best_idx = torch.argmin(distance).item()
-        best_distance = torch.min(distance).item()
-        logging.info(f"  [Oracle] 用户的真实最优数据点索引为: {true_best_idx}")
-
-        DATA["Best P"] = D[true_best_idx].tolist()
-
-        start_time = time.time()
-
-        DATA["Time"].append(start_time)
-
-        at_best_idx, rounds, at_queries = anchor_tracking_algorithm(D, true_e, true_u)
-        at_time = time.time() - start_time
-        # at_success = (at_best_idx == true_best_idx)
-
-        if at_best_idx != -1:
-            # 获取 AT 算法找到的点的实际加权距离
-            at_distance = get_weighted_distance_sq(D[at_best_idx], true_e, true_u).item()
-            # 判断距离是否在允许的误差范围内：d <= d* * (1 + EPS)
-            at_success = (at_distance <= best_distance * (1 + EPS))
+            survivors = self.samples
+        if len(survivors):
+            state = survivors.mean(axis=0)
         else:
-            # 如果算法未返回有效点，则直接判定为失败
-            at_distance = float('inf')
-            at_success = False
+            # Interior starting point for the sampler only; never returned as an anchor.
+            projected = A.copy()
+            projected[:, :d] -= projected[:, :d].mean(axis=1, keepdims=True)
+            radii = np.linalg.norm(projected, axis=1)
+            eq = np.zeros((1,2*d+1)); eq[0,:d] = 1.
+            result = linprog(np.r_[np.zeros(2*d),-1.],
+                             A_ub=np.c_[A,radii], b_ub=np.zeros(len(A)),
+                             A_eq=eq, b_eq=[1.], bounds=[(None,None)]*(2*d)+[(0,1)],
+                             method="highs", options={"primal_feasibility_tolerance": 1e-9,
+                                                      "dual_feasibility_tolerance": 1e-9})
+            if not result.success:
+                self.last_status = "sampler_lp_failed"
+                self.samples = np.empty((0,2*d))
+                return self.samples
+            state = result.x[:2*d]
+        draws = []
+        for step in range(config.burn_in+config.samples*config.thinning):
+            direction = self.rng.normal(size=2*d)
+            direction[:d] -= direction[:d].mean()
+            direction /= np.sqrt(np.sum(direction*direction))
+            slack, slopes = -row_dots(A,state), row_dots(A,direction)
+            if np.min(slack) < -config.tolerance:
+                break
+            slack = np.maximum(slack, 0.)
+            positive, negative = slopes > 1e-14, slopes < -1e-14
+            low = np.max(slack[negative]/slopes[negative], initial=-np.inf)
+            high = np.min(slack[positive]/slopes[positive], initial=np.inf)
+            if not np.isfinite(low+high) or low > high:
+                break
+            state = state + (low+(high-low)*self.rng.uniform(1e-7,1-1e-7))*direction
+            if step >= config.burn_in and (step-config.burn_in)%config.thinning == 0:
+                if np.all(row_dots(A,state) <= config.tolerance):
+                    draws.append(state.copy())
+        self.samples = np.asarray(draws).reshape(-1,2*d)
+        self.last_status = "ok" if len(draws)==config.samples else "incomplete_cloud"
+        return self.samples
 
 
+def best_item_labels(points, samples, point_chunk=512):
+    """Exact argmin over ALL dataset points for each scoring sample.
 
-        # --- 新增：AT 评估指标计算 ---
-        if at_best_idx != -1:
-            # 获取排名 (注意：PyTorch argsort 后找 index 的操作)
-            sorted_indices = torch.argsort(distance)
-            rank = (sorted_indices == at_best_idx).nonzero(as_tuple=True)[0][0].item()
-            # 计算距离偏差 (加 1e-9 防止分母为 0)
-            dis_bias = (get_weighted_distance_sq(D[at_best_idx], true_e, true_u).item() - best_distance) / (
-                        best_distance + 1e-9)
-        else:
-            rank = n - 1
-            dis_bias = float('inf')
+    Scores omit the point-independent sum(u*e^2). Chunking bounds memory;
+    non-BLAS einsum avoids the Windows NumPy/PyTorch OpenMP conflict.
+    """
+    points = np.asarray(points,dtype=np.float64)
+    samples = np.asarray(samples,dtype=np.float64)
+    if points.ndim != 2 or not len(points) or point_chunk < 1:
+        raise ValueError("Nonempty 2D points and a positive chunk size required")
+    d = points.shape[1]
+    if samples.ndim != 2 or samples.shape[1] != 2*d:
+        raise ValueError("Expected samples in (u,z) coordinates")
+    if not np.all(np.isfinite(points)) or not np.all(np.isfinite(samples)):
+        raise ValueError("Points and samples must be finite")
+    if not len(samples):
+        return np.empty(0,dtype=int)
+    best_scores = np.full(len(samples),np.inf)
+    labels = np.full(len(samples),-1,dtype=int)
+    for start in range(0,len(points),point_chunk):
+        chunk = points[start:start+point_chunk]
+        scores = (np.einsum("si,pi->sp",samples[:,:d],chunk*chunk,optimize=False)
+                  -2*np.einsum("si,pi->sp",samples[:,d:],chunk,optimize=False))
+        local = np.argmin(scores,axis=1)
+        values = scores[np.arange(len(samples)),local]
+        improve = values < best_scores  # exact ties retain the lowest dataset index
+        labels[improve] = start+local[improve]
+        best_scores[improve] = values[improve]
+    return labels
 
-        at_results.append({
-            'queries': at_queries,
-            'success': at_success,
-            'time': at_time,
-            'dis_bias': dis_bias,
-            'rank': rank
-        })
-        events = DATA["Comparisons"]
-        assert at_queries == sum(event["cost"] for event in events)
-        at_results[-1].update(rounds=rounds, comparison_requests=len(events),
-                              cache_hits=sum(event["cached"] for event in events))
-        DATA["Result"] = at_results[-1]
-        logging.info("[A cache] requests=%d actual=%d hits=%d", len(events), at_queries,
-                     at_results[-1]["cache_hits"])
 
-        logging.info(
-            f"  [AT 算法] 返回点: {at_best_idx} | 排名: {rank + 1}/{n} | 偏差: {dis_bias:.4f} | 运行次数: {rounds} |提问次数: {at_queries} | 命中: {at_success}")
+def entropy(counts):
+    counts = np.asarray(counts,dtype=np.float64)
+    total = counts.sum()
+    if total <= 0:
+        return 0.
+    probabilities = counts[counts>0]/total
+    return float(-np.sum(probabilities*np.log2(probabilities)))
 
-        DATA["Time"][0] = 0
-        if DEBUG:
-            with open(os.path.join(ROUTE_PATH, f"eu_route_{i}.json"), "w") as f:
-                json.dump(DATA, f)
 
-    # 5. 统计报告
-    logging.info("\n" + "=" * 40)
-    logging.info(f"实验结果统计 ( {num_experiments}次平均)")
-    logging.info("=" * 40)
+def label_information_gain(labels, left_probabilities):
+    """Empirical I(best-item label; binary answer), in bits.
 
-    at_valid_results = [r for r in at_results if r['rank'] != (n - 1)]
+    Near-tie parameter samples can give each answer half their mass, rather
+    than inventing an informative third response or discarding their labels.
+    """
+    labels = np.asarray(labels)
+    probabilities = np.asarray(left_probabilities,dtype=np.float64)
+    if labels.ndim!=1 or probabilities.shape!=labels.shape:
+        raise ValueError("Labels and probabilities must be equally sized vectors")
+    if not np.all(np.isfinite(probabilities)) or np.any((probabilities<0)|(probabilities>1)):
+        raise ValueError("Answer probabilities must lie in [0,1]")
+    if not len(labels):
+        return dict(information_gain=0.,prior_entropy=0.,expected_entropy=0.,left_probability=None)
+    _,inverse = np.unique(labels,return_inverse=True)
+    counts = np.bincount(inverse)
+    left_counts = np.bincount(inverse,weights=probabilities,minlength=len(counts))
+    right_counts = counts-left_counts
+    p_left = float(probabilities.mean())
+    prior = entropy(counts)
+    expected = p_left*entropy(left_counts)+(1-p_left)*entropy(right_counts)
+    return dict(information_gain=max(0.,prior-expected),prior_entropy=prior,
+                expected_entropy=expected,left_probability=p_left)
 
-    if len(at_valid_results) > 0:
-        at_avg_queries = np.mean([r['queries'] for r in at_valid_results])
-        at_rank = np.mean([(r['rank'] + 1) for r in at_valid_results])
-        at_bias = np.mean([r['dis_bias'] for r in at_valid_results])
+
+def select_pair(points, samples, candidates, tolerance=1e-9):
+    """Maximize best-item information gain, with a rebuttal/index tie break.
+
+    Labels are exact minimizers over ALL dataset items for each sampled
+    parameter. Probabilities are empirical proxy probabilities, not a certified
+    posterior. Near ties receive half mass, using a binary answer model.
+    Empty samples or globally zero gain fall back to balanced-answer selection.
+    """
+    if not candidates:
+        return None, dict(reason="no_unasked_pair", fallback=False)
+    labels = best_item_labels(points, samples) if len(samples) else np.empty(0, dtype=int)
+    diagnostics = dict(samples=len(samples), distinct_best_items=len(np.unique(labels)),
+                       candidate_count_scored=len(candidates))
+    ranked = []
+    for pair, sources in candidates.items():
+        left, right = points[list(pair)]
+        row = np.r_[left*left-right*right, -2*(left-right)]
+        norm = np.sqrt(np.sum(row*row))
+        gaps = row_dots(samples, row/max(norm, 1e-15))
+        probabilities = np.where(gaps < -tolerance, 1., np.where(gaps > tolerance, 0., .5))
+        info = label_information_gain(labels, probabilities)
+        info.update(sources=sources, near_ties=int(np.count_nonzero(probabilities == .5)))
+        ranked.append((pair, info))
+    best_gain = max(info["information_gain"] for _, info in ranked)
+    if not len(samples) or best_gain <= 1e-12:
+        pair, original = balanced_pair(points, samples, candidates, tolerance)
+        info = next(info for key, info in ranked if key == pair)
+        return pair, dict(original, **diagnostics, **info, fallback=True,
+                          fallback_reason="empty_cloud" if not len(samples) else "zero_gain",
+                          balanced_reason=original["reason"],
+                          reason="balanced_fallback")
+    tied = [(pair, info) for pair, info in ranked if best_gain-info["information_gain"] <= 1e-12]
+    pair, info = min(tied, key=lambda entry: (-int("rebuttal" in entry[1]["sources"]), entry[0]))
+    return pair, dict(**diagnostics, **info, fallback=False, reason="best_item_information_gain")
+
+
+def anchor_tracking_algorithm(D, true_e, true_u, max_round=500,
+                              config=SelectionConfig(), initial_anchor=None):
+    """Each question is followed by an anchor update and full replanning.
+
+    initial_anchor enables exact pairing without sharing the query-sampler RNG.
+    max_round retains the 500-round safeguard; zero-query relocations count too.
+    """
+    started = time.perf_counter()
+    data = DATA
+    data.clear()
+    best, _ = at_find_nearest_neighbor(D, true_e, true_u)
+    data.update({"Best P": D[best].tolist(), "E-U Route": [],
+                 "True E-U": [true_e.tolist(), true_u.tolist()], "Time": []})
+    data["RNG before anchor"] = torch.get_rng_state().tolist()
+    if D.device.type == "cuda":
+        data["CUDA RNG before anchor"] = torch.cuda.get_rng_state(D.device).tolist()
+    if initial_anchor is None:
+        lower, upper = D.min(dim=0).values, D.max(dim=0).values
+        e = lower+torch.rand(D.shape[1], device=D.device)*(upper-lower)
+        u = torch.distributions.Dirichlet(torch.ones(D.shape[1],device=D.device)).sample()
     else:
-        at_avg_queries = at_rank = at_bias = float('nan')
+        e, u = [torch.as_tensor(x,dtype=D.dtype,device=D.device).clone() for x in initial_anchor]
+    data["Initial E-U"] = [e.tolist(), u.tolist()]
+    cache = ComparisonCache(D,true_e,true_u)
+    data["Comparisons"], data["C Decisions"] = cache.events, []
+    history = []
+    data["Feedback"] = history
+    points = D.detach().cpu().numpy().astype(np.float64)
+    sampler = FeasibleSamples(points,config)
+    rounds = 0
+    while rounds < max_round:
+        p, _ = at_find_nearest_neighbor(D,e,u)
+        # A cache may already prove certain challengers lose to this incumbent.
+        # These exclusions are rebuilt for each incumbent, never carried globally.
+        known_losers = set()
+        for (left,right), outcome in cache.answers.items():
+            if outcome == -1 and p == left:
+                known_losers.add(right)
+            elif outcome == 1 and p == right:
+                known_losers.add(left)
+        q, ep, up = at_check_stopping_condition_LP(
+            history,D,p,e,u,known_losers,device=D.device)
+        if q is None:
+            data["Termination"] = "LP"
+            data["Feedback"] = history
+            return p,rounds,cache.queries_used
 
-    at_success_rate = np.mean([r['success'] for r in at_results])
-    at_top5 = np.sum([1 for r in at_results if r['rank'] < 5])  # rank 是 0 索引，< 5 即 Top-5
-    at_fail = np.sum([1 for r in at_results if r['rank'] == (n - 1)])
-    at_avg_time = np.mean([r['time'] for r in at_results])
+        key = tuple(sorted((p,q)))
+        if key in cache.answers:
+            # Relocate the anchor when a known answer already rejects the incumbent.
+            prefers_p, _ = cache.compare(p,q,"cached_rebuttal")
+            if not prefers_p and cache.answers[key] != 0:
+                e,u = ep,up
+                data["C Decisions"].append(dict(round=rounds,action="cached_relocation",pair=[p,q]))
+                rounds += 1
+                continue
+            # The strict LP and an exact tied answer can disagree; do not loop or
+            # certify convergence based on sample consensus / a missing question.
+            data["Termination"] = "cached_rebuttal_conflict"
+            data["Feedback"] = history
+            return p,rounds,cache.queries_used
 
-    logging.info(f"[Anchor Tracking] 命中率: {at_success_rate:.4f}")
-    logging.info(f"[Anchor Tracking] Top-5 命中率: {at_top5}/{num_experiments}")
-    logging.info(f"[Anchor Tracking] 平均排位: {at_rank:.1f}/{n}")
-    logging.info(f"[Anchor Tracking] 平均偏差: {at_bias:.4f}")
-    logging.info(f"[Anchor Tracking] 平均提问次数: {at_avg_queries:.1f}")
-    with open("experiments/A/results.json", "w", encoding="utf-8") as f:
-        json.dump({"args": vars(args), "results": at_results}, f, indent=2)
-    logging.info(f"[Anchor Tracking] 失败次数: {at_fail}/{num_experiments}")
+        u_chain, _ = at_construct_q_chain_alternating(D,e,u,ep,up,True)
+        e_chain, _ = at_construct_q_chain_alternating(D,e,u,ep,up,False)
+        candidates = candidate_pairs(u_chain,e_chain,p,q,cache.answers)
+        samples = sampler.draw(history)
+        pair, info = select_pair(points,samples,candidates,config.tolerance)
+        if pair is None:
+            raise RuntimeError("AT has an unseen rebuttal but no candidate question")
+        left,right = pair
+        source = "C:"+"+".join(info["sources"])
+        prefers_left,cost = cache.compare(left,right,source)
+        if cost != 1:
+            raise RuntimeError("AT selected an already answered question")
+        winner,loser = (left,right) if prefers_left else (right,left)
+        history.append((winner,loser))
+        if pair == key and winner == q:
+            e,u = ep,up  # use the feasible rebuttal anchor
+            update = "A_rebuttal_jump"
+        else:
+            e,u = at_alternating_learning(D,history,e,u,device=D.device)
+            update = "A_alternating_learning"
+        # Keep timestamps and anchors aligned after each paid answer is applied.
+        if D.device.type == "cuda":
+            torch.cuda.synchronize(D.device)
+        data["E-U Route"].append([e.tolist(),u.tolist()])
+        data["Time"].append(time.perf_counter() - started)
+        data["C Decisions"].append(dict(round=rounds,action="ask_one",pair=list(pair),
+                                         winner=winner,incumbent=p,rebuttal=q,
+                                         u_chain_length=len(u_chain),e_chain_length=len(e_chain),
+                                         candidate_count=len(candidates),sampler_status=sampler.last_status,
+                                         anchor_update=update,**info))
+        rounds += 1
+    data["Termination"] = "max_round"
+    data["Feedback"] = history
+    p,_ = at_find_nearest_neighbor(D,e,u)
+    return p,rounds,cache.queries_used
 
+
+def main(args, output_dir=None, config=SelectionConfig()):
+    """Run independent AT trials; optionally export monitoring and results as JSON."""
+    configure(args.dtype)
+    setup_logging()
+    if args.rounds < 1 or args.data_size < 1:
+        raise ValueError("rounds and data_size must be positive")
+    values = load_dataset(args.data)
+    if values is None:
+        raise ValueError("Cannot load dataset; check the path and file format")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    D = torch.as_tensor(values[:args.data_size], dtype=TORCH_DTYPE, device=device)
+    n, d = D.shape
+    logging.info("Dataset: %s | Items: %d | Dimensions: %d | Device: %s", args.data, n, d, device)
+    save_json = getattr(args, "save_json", True)
+    output = None
+    if save_json:
+        output = Path(output_dir or getattr(args, "output_dir", None) or
+                      Path("experiments") / "AT" / ("run_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")))
+        output.mkdir(parents=True, exist_ok=False)
+        (output / "routes").mkdir()
+
+    lower, upper = D.min(dim=0).values, D.max(dim=0).values
+    prior = torch.distributions.Dirichlet(torch.ones(d, device=device))
+    results = []
+    for i in range(args.rounds):
+        true_u = prior.sample()
+        true_e = lower + torch.rand(d, device=device) * (upper - lower)
+        distances = get_weighted_distance_sq(D, true_e, true_u)
+        best = int(torch.argmin(distances))
+        best_distance = distances[best].item()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        started = time.perf_counter()
+        p, rounds, queries = anchor_tracking_algorithm(
+            D, true_e, true_u, config=replace(config, seed=config.seed + i))
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elapsed = time.perf_counter() - started
+        distance = distances[p].item()
+        rank = int((torch.argsort(distances) == p).nonzero(as_tuple=True)[0][0])
+        events = DATA["Comparisons"]
+        result = dict(queries=queries, success=distance <= best_distance * (1 + args.eps),
+                      time=elapsed, dis_bias=(distance - best_distance) / (best_distance + 1e-9),
+                      rank=rank, rounds=rounds, comparison_requests=len(events),
+                      cache_hits=sum(event["cached"] for event in events),
+                      returned_index=p, true_index=best, termination=DATA["Termination"],
+                      information_selections=sum(x.get("reason") == "best_item_information_gain"
+                                                 for x in DATA["C Decisions"]),
+                      selection_fallbacks=sum(x.get("fallback", False) for x in DATA["C Decisions"]))
+        assert queries == sum(event["cost"] for event in events)
+        assert queries == len(DATA["Time"]) == len(DATA["E-U Route"])
+        DATA["Result"] = result
+        results.append(result)
+        logging.info("[AT %d/%d] Item: %d | Rank: %d/%d | Bias: %.4f | Rounds: %d | "
+                     "Queries: %d | Success: %s | Stop: %s | Time: %.3fs",
+                     i + 1, args.rounds, p, rank + 1, n, result["dis_bias"], rounds,
+                     queries, result["success"], result["termination"], elapsed)
+        if output is not None:
+            (output / "routes" / f"eu_route_{i}.json").write_text(json.dumps(DATA, indent=2), encoding="utf-8")
+            (output / "results.json").write_text(
+                json.dumps(dict(args=vars(args), results=results), indent=2), encoding="utf-8")
+
+    logging.info("[AT Summary] Trials: %d | Success rate: %.4f | Mean queries: %.1f | Mean time: %.3fs",
+                 len(results), np.mean([r["success"] for r in results]),
+                 np.mean([r["queries"] for r in results]), np.mean([r["time"] for r in results]))
+    if output is not None:
+        logging.info("JSON output saved to %s", output)
+    return results
 
 
 if __name__ == "__main__":
-    main()
+    from run import parse_args
+    main(parse_args().parse_args())
