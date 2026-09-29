@@ -9,12 +9,12 @@ def parse_args():
     parser.add_argument('--data_size', type=int, default=10000)
     parser.add_argument('--rounds',  type=int, default=100)
     parser.add_argument("--eps", type=float, default=0.0)
-    # AT uses the selected candidate information-gain strategy.
+    # Shared numerical precision and monitoring output options.
     parser.add_argument('--dtype', choices=('float32', 'float64'), default="float32")
     parser.add_argument('--save-json', action=argparse.BooleanOptionalAction, default=True,
-                        help='Export AT monitoring routes and results as JSON (default: enabled)')
+                        help='Export monitoring routes and results as JSON (default: enabled)')
     parser.add_argument('--output-dir', default=None,
-                        help='Directory for AT JSON output (default: experiments/AT/run_<timestamp>)')
+                        help='Directory for JSON output (default: experiments/<algorithm>/run_<timestamp>)')
     # RS sampling budget.
     parser.add_argument('--N', type=int, default=5000)
 

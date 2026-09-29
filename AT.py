@@ -5,30 +5,20 @@ Information gain scores questions only; the stopping decision uses the LP.
 DATA keeps the existing monitoring schema. Each Time / E-U Route entry is
 recorded after one paid question and its anchor update; cached answers add none.
 """
-import json
-import logging
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime
-from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
 from scipy.optimize import linprog
 
 
-def _initialize_highs_before_torch():
-    # Initialize HiGHS first to avoid the Windows numerical-runtime conflict.
-    linprog(np.array([1.0]), A_ub=np.array([[-1.0]]), b_ub=np.array([0.0]),
-            bounds=[(0, 1)], method="highs")
-
-
-_initialize_highs_before_torch()
+# Import shared runtime initialization before importing PyTorch.
+from utils import (get_weighted_distance_sq, initialize_monitor, record_query_state,
+                   run_experiments, setup_logging)
 
 import torch
 import torch.nn.functional as F
-
-from utils import get_weighted_distance_sq, load_dataset, setup_logging
 
 
 DATA = {"Best P": [], "E-U Route": [], "True E-U": [], "Time": []}
@@ -64,8 +54,8 @@ class ComparisonCache:
         elif cached:
             outcome, cost = self.answers[key], 0
         else:
-            a = torch.sum(self.u * (self.D[key[0]] - self.e) ** 2)
-            b = torch.sum(self.u * (self.D[key[1]] - self.e) ** 2)
+            a = get_weighted_distance_sq(self.D[key[0]], self.e, self.u)
+            b = get_weighted_distance_sq(self.D[key[1]], self.e, self.u)
             outcome = -1 if a < b else (1 if b < a else 0)
             self.answers[key] = outcome
             self.queries_used += 1
@@ -78,7 +68,7 @@ class ComparisonCache:
 
 def at_find_nearest_neighbor(D: torch.Tensor, e: torch.Tensor, u: torch.Tensor) -> Tuple[int, torch.Tensor]:
     """Return the nearest item under the current weighted squared distance."""
-    distances = torch.sum(u * (D - e) ** 2, dim=-1)
+    distances = get_weighted_distance_sq(D, e, u)
 
     p_idx = torch.argmin(distances).item()
 
@@ -137,7 +127,7 @@ def at_check_stopping_condition_LP(
     z_coefs_obj = -2 * (D_np - p_star_np)
     C_all = np.concatenate([u_coefs_obj, z_coefs_obj], axis=-1)
 
-    current_distances = torch.sum(u * (D - e) ** 2, dim=-1)
+    current_distances = get_weighted_distance_sq(D, e, u)
     sorted_q_indices = torch.argsort(current_distances).cpu().numpy()
 
     for q_idx in sorted_q_indices:
@@ -572,13 +562,7 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500,
     """
     started = time.perf_counter()
     data = DATA
-    data.clear()
-    best, _ = at_find_nearest_neighbor(D, true_e, true_u)
-    data.update({"Best P": D[best].tolist(), "E-U Route": [],
-                 "True E-U": [true_e.tolist(), true_u.tolist()], "Time": []})
-    data["RNG before anchor"] = torch.get_rng_state().tolist()
-    if D.device.type == "cuda":
-        data["CUDA RNG before anchor"] = torch.cuda.get_rng_state(D.device).tolist()
+    initialize_monitor(data, D, true_e, true_u)
     if initial_anchor is None:
         lower, upper = D.min(dim=0).values, D.max(dim=0).values
         e = lower+torch.rand(D.shape[1], device=D.device)*(upper-lower)
@@ -645,11 +629,7 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500,
         else:
             e,u = at_alternating_learning(D,history,e,u,device=D.device)
             update = "A_alternating_learning"
-        # Keep timestamps and anchors aligned after each paid answer is applied.
-        if D.device.type == "cuda":
-            torch.cuda.synchronize(D.device)
-        data["E-U Route"].append([e.tolist(),u.tolist()])
-        data["Time"].append(time.perf_counter() - started)
+        record_query_state(data, e, u, started)
         data["C Decisions"].append(dict(round=rounds,action="ask_one",pair=list(pair),
                                          winner=winner,incumbent=p,rebuttal=q,
                                          u_chain_length=len(u_chain),e_chain_length=len(e_chain),
@@ -663,73 +643,23 @@ def anchor_tracking_algorithm(D, true_e, true_u, max_round=500,
 
 
 def main(args, output_dir=None, config=SelectionConfig()):
-    """Run independent AT trials; optionally export monitoring and results as JSON."""
+    """Run independent AT trials with shared monitoring and optional JSON export."""
     configure(args.dtype)
     setup_logging()
-    if args.rounds < 1 or args.data_size < 1:
-        raise ValueError("rounds and data_size must be positive")
-    values = load_dataset(args.data)
-    if values is None:
-        raise ValueError("Cannot load dataset; check the path and file format")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    D = torch.as_tensor(values[:args.data_size], dtype=TORCH_DTYPE, device=device)
-    n, d = D.shape
-    logging.info("Dataset: %s | Items: %d | Dimensions: %d | Device: %s", args.data, n, d, device)
-    save_json = getattr(args, "save_json", True)
-    output = None
-    if save_json:
-        output = Path(output_dir or getattr(args, "output_dir", None) or
-                      Path("experiments") / "AT" / ("run_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")))
-        output.mkdir(parents=True, exist_ok=False)
-        (output / "routes").mkdir()
 
-    lower, upper = D.min(dim=0).values, D.max(dim=0).values
-    prior = torch.distributions.Dirichlet(torch.ones(d, device=device))
-    results = []
-    for i in range(args.rounds):
-        true_u = prior.sample()
-        true_e = lower + torch.rand(d, device=device) * (upper - lower)
-        distances = get_weighted_distance_sq(D, true_e, true_u)
-        best = int(torch.argmin(distances))
-        best_distance = distances[best].item()
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        started = time.perf_counter()
+    def solve(D, true_e, true_u, case):
         p, rounds, queries = anchor_tracking_algorithm(
-            D, true_e, true_u, config=replace(config, seed=config.seed + i))
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        elapsed = time.perf_counter() - started
-        distance = distances[p].item()
-        rank = int((torch.argsort(distances) == p).nonzero(as_tuple=True)[0][0])
+            D, true_e, true_u, config=replace(config, seed=config.seed + case))
         events = DATA["Comparisons"]
-        result = dict(queries=queries, success=distance <= best_distance * (1 + args.eps),
-                      time=elapsed, dis_bias=(distance - best_distance) / (best_distance + 1e-9),
-                      rank=rank, rounds=rounds, comparison_requests=len(events),
-                      cache_hits=sum(event["cached"] for event in events),
-                      returned_index=p, true_index=best, termination=DATA["Termination"],
-                      information_selections=sum(x.get("reason") == "best_item_information_gain"
-                                                 for x in DATA["C Decisions"]),
-                      selection_fallbacks=sum(x.get("fallback", False) for x in DATA["C Decisions"]))
-        assert queries == sum(event["cost"] for event in events)
-        assert queries == len(DATA["Time"]) == len(DATA["E-U Route"])
-        DATA["Result"] = result
-        results.append(result)
-        logging.info("[AT %d/%d] Item: %d | Rank: %d/%d | Bias: %.4f | Rounds: %d | "
-                     "Queries: %d | Success: %s | Stop: %s | Time: %.3fs",
-                     i + 1, args.rounds, p, rank + 1, n, result["dis_bias"], rounds,
-                     queries, result["success"], result["termination"], elapsed)
-        if output is not None:
-            (output / "routes" / f"eu_route_{i}.json").write_text(json.dumps(DATA, indent=2), encoding="utf-8")
-            (output / "results.json").write_text(
-                json.dumps(dict(args=vars(args), results=results), indent=2), encoding="utf-8")
+        diagnostics = dict(rounds=rounds, comparison_requests=len(events),
+                           cache_hits=sum(event["cached"] for event in events),
+                           returned_index=p, termination=DATA["Termination"],
+                           information_selections=sum(x.get("reason") == "best_item_information_gain"
+                                                      for x in DATA["C Decisions"]),
+                           selection_fallbacks=sum(x.get("fallback", False) for x in DATA["C Decisions"]))
+        return [p], queries, diagnostics
 
-    logging.info("[AT Summary] Trials: %d | Success rate: %.4f | Mean queries: %.1f | Mean time: %.3fs",
-                 len(results), np.mean([r["success"] for r in results]),
-                 np.mean([r["queries"] for r in results]), np.mean([r["time"] for r in results]))
-    if output is not None:
-        logging.info("JSON output saved to %s", output)
-    return results
+    return run_experiments(args, "AT", DATA, solve, TORCH_DTYPE, output_dir=output_dir)
 
 
 if __name__ == "__main__":
