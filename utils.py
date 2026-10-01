@@ -10,9 +10,11 @@ from scipy.optimize import linprog
 
 
 def _initialize_highs_before_torch():
-    # Initialize HiGHS first to avoid the Windows numerical-runtime conflict.
+    # Initialize HiGHS and NumPy's lazy LAPACK runtime before PyTorch on Windows.
     linprog(np.array([1.0]), A_ub=np.array([[-1.0]]), b_ub=np.array([0.0]),
             bounds=[(0, 1)], method="highs")
+    np.linalg.svd(np.eye(4), full_matrices=False)
+    np.linalg.norm(np.eye(4), axis=1)
 
 
 _initialize_highs_before_torch()
@@ -161,6 +163,8 @@ def run_experiments(args, algorithm, data, solve, dtype, *, output_dir=None,
         elapsed = time.perf_counter() - started
         result = evaluate_selection(distances, indices, args.eps,
                                     eps_power=eps_power, bias_offset=bias_offset)
+        if diagnostics.get("algorithm_valid") is False:
+            result["success"] = False
         result.update(queries=queries, time=elapsed, **diagnostics)
         assert queries == len(data["Time"]) == len(data["E-U Route"])
         assert queries == sum(event["cost"] for event in data["Comparisons"])

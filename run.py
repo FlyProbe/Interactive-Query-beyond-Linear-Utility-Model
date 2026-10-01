@@ -15,6 +15,8 @@ def parse_args():
                         help='Export monitoring routes and results as JSON (default: enabled)')
     parser.add_argument('--output-dir', default=None,
                         help='Directory for JSON output (default: experiments/<algorithm>/run_<timestamp>)')
+    parser.add_argument('--debug', action=argparse.BooleanOptionalAction, default=False,
+                        help='AT: retain recovery, chain, LP and learning intermediate states (default: disabled)')
     # RS sampling budget.
     parser.add_argument('--N', type=int, default=5000)
 

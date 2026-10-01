@@ -1,21 +1,22 @@
-"""Anchor tracking with candidate information gain (the selected ACIG strategy).
+"""Anchor tracking with ACIG selection, joint recovery and stabilized updates.
 
 Select one unseen question, update the anchor, then replan both chains.
 Information gain scores questions only; the stopping decision uses the LP.
 DATA keeps the existing monitoring schema. Each Time / E-U Route entry is
 recorded after one paid question and its anchor update; cached answers add none.
+Detailed recovery, chain and learning states are recorded only with debug=True.
 """
 import time
 from dataclasses import dataclass, replace
-from typing import List, Optional, Tuple
+from typing import Tuple
 
 import numpy as np
-from scipy.optimize import linprog
+from at_feasibility import FeedbackPolytope, FeasibilityFailure, RecoveryConfig
 
 
 # Import shared runtime initialization before importing PyTorch.
 from utils import (get_weighted_distance_sq, initialize_monitor, record_query_state,
-                   run_experiments, setup_logging)
+                   run_experiments, setup_logging, synchronize)
 
 import torch
 import torch.nn.functional as F
@@ -77,80 +78,26 @@ def at_find_nearest_neighbor(D: torch.Tensor, e: torch.Tensor, u: torch.Tensor) 
     return p_idx, p_val
 
 
+def _feedback_records(history):
+    """Accept legacy winner/loser tuples as well as explicit tie records."""
+    return [dict(record) if isinstance(record, dict) else
+            dict(left=int(record[0]), right=int(record[1]), relation='strict')
+            for record in history]
+
+
+def _polytope(D, history, recovery_config=None):
+    dtype = 'float64' if D.dtype == torch.float64 else 'float32'
+    return FeedbackPolytope(D.detach().cpu().numpy(), _feedback_records(history),
+                            recovery_config, dtype)
+
+
 def at_check_stopping_condition_LP(
-        history_constraints: List[Tuple[int, int]],
-        D: torch.Tensor,
-        p_idx: int,
-        e: torch.Tensor,
-        u: torch.Tensor,
-        visited_rebuttals: set,
-        device: str = "cpu"
-) -> Tuple[Optional[int], Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Return the first feasible challenger and its anchor, or certify LP termination."""
-    _, d = D.shape
-    p_star = D[p_idx]
-
-    # Lift feedback to linear constraints in (u, z), where z = u * e.
-    if len(history_constraints) > 0:
-        winners = torch.tensor([h[0] for h in history_constraints], dtype=torch.long, device=device)
-        losers = torch.tensor([h[1] for h in history_constraints], dtype=torch.long, device=device)
-        P_k = D[winners]
-        Q_k = D[losers]
-
-        u_coefs_H = P_k ** 2 - Q_k ** 2
-        z_coefs_H = -2 * (P_k - Q_k)
-        A_ub_H = torch.cat([u_coefs_H, z_coefs_H], dim=-1)
-        b_ub_H = torch.full((len(history_constraints),), -LP_ACC, device=device)
-    else:
-        A_ub_H = torch.empty((0, 2 * d), device=device)
-        b_ub_H = torch.empty((0,), device=device)
-
-    A_ub_bounds = torch.zeros((d, 2 * d), device=device)
-    A_ub_bounds[torch.arange(d), torch.arange(d)] = -1.0
-    A_ub_bounds[torch.arange(d), torch.arange(d) + d] = 1.0
-    b_ub_bounds = torch.zeros(d, device=device)
-
-    A_ub = torch.cat([A_ub_H, A_ub_bounds], dim=0).cpu().numpy()
-    b_ub = torch.cat([b_ub_H, b_ub_bounds], dim=0).cpu().numpy()
-
-    A_eq = np.zeros((1, 2 * d))
-    A_eq[0, :d] = 1.0
-    b_eq = np.array([1.0])
-
-    E_max_val = torch.max(D).item()
-    bounds = [(0, 1)] * d + [(0, E_max_val)] * d
-
-    D_np = D.cpu().numpy()
-    p_star_np = p_star.cpu().numpy()
-
-    u_coefs_obj = D_np ** 2 - p_star_np ** 2
-    z_coefs_obj = -2 * (D_np - p_star_np)
-    C_all = np.concatenate([u_coefs_obj, z_coefs_obj], axis=-1)
-
-    current_distances = get_weighted_distance_sq(D, e, u)
-    sorted_q_indices = torch.argsort(current_distances).cpu().numpy()
-
-    for q_idx in sorted_q_indices:
-        q_idx = int(q_idx)
-        if q_idx == p_idx or q_idx in visited_rebuttals:
-            continue
-
-        c = C_all[q_idx]
-        res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
-
-        if res.success and res.fun < -LP_ACC:
-            u_prime = res.x[:d]
-            z_prime = res.x[d:]
-
-            u_safe = np.clip(u_prime, LP_SAFE, None)
-            e_prime = z_prime / u_safe
-
-            u_prime_tensor = torch.tensor(u_prime, dtype=TORCH_DTYPE, device=device)
-            e_prime_tensor = torch.tensor(e_prime, dtype=TORCH_DTYPE, device=device)
-
-            return q_idx, e_prime_tensor, u_prime_tensor
-
-    return None, None, None
+        history_constraints, D, p_idx, e, u, visited_rebuttals, device='cpu', *,
+        poly=None, recovery_config=None):
+    """Find a validated challenger; numerical failures never certify stopping."""
+    if poly is None:
+        poly = _polytope(D, history_constraints, recovery_config)
+    return challenger(poly, D, p_idx, e, u, visited_rebuttals)
 
 
 def at_construct_q_chain_alternating(D: torch.Tensor, e: torch.Tensor, u: torch.Tensor,
@@ -225,90 +172,17 @@ def at_construct_q_chain_alternating(D: torch.Tensor, e: torch.Tensor, u: torch.
 
 
 def at_alternating_learning(
-        D: torch.Tensor,
-        history_constraints: List[Tuple[int, int]],
-        current_e: torch.Tensor,
-        current_u: torch.Tensor,
-        max_iter: int = 500,
-        init_lr: float = 0.5,
-        device: str = "cpu"
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Alternate feasible likelihood descent in weights and the ideal point."""
-    e, u = current_e.clone(), current_u.clone()
+        D, history_constraints, current_e, current_u, max_iter=500, init_lr=.5,
+        device='cpu', *, proximal_strength=1., recovery_config=None, poly=None):
+    """Restore all feedback jointly before stabilized alternating descent.
 
-    if len(history_constraints) == 0:
-        return e, u
-
-    E_min = torch.min(D, dim=0)[0]
-    E_max = torch.max(D, dim=0)[0]
-
-    p_indices = torch.tensor([h[0] for h in history_constraints], dtype=torch.long, device=device)
-    q_indices = torch.tensor([h[1] for h in history_constraints], dtype=torch.long, device=device)
-    P = D[p_indices]
-    Q = D[q_indices]
-
-    def compute_likelihood_and_constraints(e_test: torch.Tensor, u_test: torch.Tensor) -> Tuple[float, bool]:
-        """Return the negative log-likelihood and strict feedback feasibility."""
-        dist_P = torch.sum(u_test * (P - e_test) ** 2, dim=-1)
-        dist_Q = torch.sum(u_test * (Q - e_test) ** 2, dim=-1)
-        delta = dist_P - dist_Q
-
-        L = torch.sum(F.softplus(delta)).item()
-
-        is_valid = torch.all(delta < 0).item()
-
-        return L, is_valid
-
-    for i in range(max_iter):
-        e_prev, u_prev = e.clone(), u.clone()
-
-        # Update weights using backtracking while preserving all feedback.
-        L_prev, _ = compute_likelihood_and_constraints(e, u)
-
-        term_p_u = (P - e) ** 2
-        term_q_u = (Q - e) ** 2
-        delta_u = torch.sum(u * term_p_u, dim=-1) - torch.sum(u * term_q_u, dim=-1)
-
-        sig_u = torch.sigmoid(delta_u).unsqueeze(-1)
-
-        grad_u = torch.mean(sig_u * (term_p_u - term_q_u), dim=0)
-
-        lr = init_lr
-
-        while lr > 1e-5:
-            u_next = torch.clamp(u - lr * grad_u, 0.001, 1.0)
-            u_next = u_next / torch.sum(u_next)
-
-            L_next, is_valid = compute_likelihood_and_constraints(e, u_next)
-
-            if L_next < L_prev and is_valid:
-                u = u_next
-                break
-
-            lr *= 0.5
-
-        # Update the ideal point with the accepted weights held fixed.
-        L_prev, _ = compute_likelihood_and_constraints(e, u)
-
-        delta_e = torch.sum(u * (P - e) ** 2, dim=-1) - torch.sum(u * (Q - e) ** 2, dim=-1)
-        sig_e = torch.sigmoid(delta_e).unsqueeze(-1)
-
-        grad_e = torch.mean(sig_e * (2 * u * (Q - P)), dim=0)
-
-        lr = init_lr
-        while lr > 1e-5:
-            e_next = torch.clamp(e - lr * grad_e, E_min, E_max)
-
-            L_next, is_valid = compute_likelihood_and_constraints(e_next, u)
-
-            if L_next < L_prev and is_valid:
-                e = e_next
-                break
-            lr *= 0.5
-
-        if i > 50 and torch.linalg.norm(e - e_prev) < 1e-5 and torch.linalg.norm(u - u_prev) < 1e-5:
-            break
-    return e, u
+    The proximal reference is the feasible anchor restored for this call.
+    Returning the old infeasible anchor is never a recovery fallback.
+    """
+    if poly is None:
+        poly = _polytope(D, history_constraints, recovery_config)
+    e, u, _ = restore_anchor(poly, current_e.clone(), current_u.clone(), D)
+    return learn(poly, D, e, u, max_iter, init_lr, proximal_strength)
 
 
 def row_dots(rows, vector):
@@ -379,76 +253,77 @@ def balanced_pair(points, samples, candidates, tolerance=1e-9):
 
 
 class FeasibleSamples:
-    """Hit-and-run proxy ensemble in the lifted feedback polytope.
+    """ACIG hit-and-run with RHS offsets and a null space for explicit ties.
 
-    Sampling in (u,z) is used only for query scoring.
-    It approximates uniform lifted-space volume, not a posterior for the
-    original uniform-e/Dirichlet-u prior. Finite-chain mixing is not certified.
+    This is a query-scoring ensemble, not a parameter posterior. Degenerate
+    clouds retain the existing information-gain fallback to the rebuttal pair.
     """
     def __init__(self, points, config=SelectionConfig()):
         self.points = np.asarray(points, dtype=np.float64)
         self.config = config
-        self.rng = np.random.default_rng(config.seed)  # independent of torch/oracle RNG
-        self.samples = np.empty((0, 2*self.points.shape[1]))
-        self.last_status = "not_sampled"
+        self.rng = np.random.default_rng(config.seed)
+        self.samples = None
+        self.last_status = 'not_sampled'
 
-    def inequalities(self, history):
-        d = self.points.shape[1]
-        I, Z = np.eye(d), np.zeros((d,d))
-        A = np.vstack((np.c_[-I,Z], np.c_[Z,-I], np.c_[-I,I]))
-        if history:
-            winners, losers = np.asarray(history, dtype=int).T
-            p, q = self.points[winners], self.points[losers]
-            feedback = np.c_[p*p-q*q, -2*(p-q)]
-            norms = np.linalg.norm(feedback, axis=1)
-            A = np.vstack((A, feedback[norms>0]/norms[norms>0,None]))
-        return A
-
-    def draw(self, history):
-        d, config = self.points.shape[1], self.config
-        A = self.inequalities(history)
-        if len(self.samples):
-            survivors = self.samples[np.all(sample_gaps(self.samples,A) <= config.tolerance, axis=1)]
+    def draw(self, poly):
+        if not isinstance(poly, FeedbackPolytope):
+            poly = FeedbackPolytope(self.points, _feedback_records(poly))
+        cfg, A, b = self.config, poly.A, poly.b
+        _, _, V = np.linalg.svd(poly.E, full_matrices=True)
+        basis = V[len(poly.E):].T
+        previous = self.samples
+        if previous is not None and len(previous):
+            okay = np.all(previous@A.T <= b+cfg.tolerance, axis=1)
+            okay &= np.all(np.abs(previous@poly.E.T-poly.f) <= cfg.tolerance, axis=1)
+            previous = previous[okay]
+        if previous is not None and len(previous):
+            state = previous.mean(axis=0)
         else:
-            survivors = self.samples
-        if len(survivors):
-            state = survivors.mean(axis=0)
-        else:
-            # Interior starting point for the sampler only; never returned as an anchor.
-            projected = A.copy()
-            projected[:, :d] -= projected[:, :d].mean(axis=1, keepdims=True)
-            radii = np.linalg.norm(projected, axis=1)
-            eq = np.zeros((1,2*d+1)); eq[0,:d] = 1.
-            result = linprog(np.r_[np.zeros(2*d),-1.],
-                             A_ub=np.c_[A,radii], b_ub=np.zeros(len(A)),
-                             A_eq=eq, b_eq=[1.], bounds=[(None,None)]*(2*d)+[(0,1)],
-                             method="highs", options={"primal_feasibility_tolerance": 1e-9,
-                                                      "dual_feasibility_tolerance": 1e-9})
+            radii = np.linalg.norm(A@basis, axis=1)
+            result = poly._lp(np.r_[np.zeros(2*poly.d), -1.], np.c_[A, radii], b,
+                              np.c_[poly.E, np.zeros(len(poly.E))], poly.f,
+                              poly.bounds+[(0., 1.)])
             if not result.success:
-                self.last_status = "sampler_lp_failed"
-                self.samples = np.empty((0,2*d))
+                self.samples = np.empty((0, 2*poly.d))
+                self.last_status = 'sampler_lp_failed'
                 return self.samples
-            state = result.x[:2*d]
+            state = result.x[:-1]
+        if not basis.shape[1]:
+            if not poly.check_theta(state)['valid']:
+                self.samples = np.empty((0, 2*poly.d))
+                self.last_status = 'invalid_zero_dimensional_state'
+                return self.samples
+            self.samples = np.repeat(state[None, :], cfg.samples, axis=0)
+            self.last_status = 'zero_dimensional'
+            return self.samples
         draws = []
-        for step in range(config.burn_in+config.samples*config.thinning):
-            direction = self.rng.normal(size=2*d)
-            direction[:d] -= direction[:d].mean()
-            direction /= np.sqrt(np.sum(direction*direction))
-            slack, slopes = -row_dots(A,state), row_dots(A,direction)
-            if np.min(slack) < -config.tolerance:
+        for step in range(cfg.burn_in+cfg.samples*cfg.thinning):
+            direction = basis@self.rng.normal(size=basis.shape[1])
+            norm = np.linalg.norm(direction)
+            if norm == 0:
+                continue
+            direction /= norm
+            slack, slopes = b-A@state, A@direction
+            if np.min(slack) < -cfg.tolerance:
                 break
             slack = np.maximum(slack, 0.)
-            positive, negative = slopes > 1e-14, slopes < -1e-14
+            negative, positive = slopes < -1e-14, slopes > 1e-14
             low = np.max(slack[negative]/slopes[negative], initial=-np.inf)
             high = np.min(slack[positive]/slopes[positive], initial=np.inf)
-            if not np.isfinite(low+high) or low > high:
+            # Enforce the explicit variable bounds as well as the domain rows.
+            for coordinate, (lower, upper) in enumerate(poly.bounds):
+                slope = direction[coordinate]
+                if abs(slope) > 1e-14:
+                    ends = ((lower-state[coordinate])/slope, (upper-state[coordinate])/slope)
+                    low, high = max(low, min(ends)), min(high, max(ends))
+            if not np.isfinite(low+high) or high < low:
                 break
-            state = state + (low+(high-low)*self.rng.uniform(1e-7,1-1e-7))*direction
-            if step >= config.burn_in and (step-config.burn_in)%config.thinning == 0:
-                if np.all(row_dots(A,state) <= config.tolerance):
+            state = state+(low+(high-low)*self.rng.uniform(1e-7, 1-1e-7))*direction
+            if step >= cfg.burn_in and (step-cfg.burn_in) % cfg.thinning == 0:
+                if poly.check_theta(state)['valid']:
                     draws.append(state.copy())
-        self.samples = np.asarray(draws).reshape(-1,2*d)
-        self.last_status = "ok" if len(draws)==config.samples else "incomplete_cloud"
+        self.samples = np.asarray(draws).reshape(-1, 2*poly.d)
+        self.last_status = 'ok' if len(draws) == cfg.samples else 'incomplete_cloud'
         return self.samples
 
 
@@ -553,93 +428,361 @@ def select_pair(points, samples, candidates, tolerance=1e-9):
     return pair, dict(**diagnostics, **info, fallback=False, reason="best_item_information_gain")
 
 
-def anchor_tracking_algorithm(D, true_e, true_u, max_round=500,
-                              config=SelectionConfig(), initial_anchor=None):
-    """Each question is followed by an anchor update and full replanning.
+def check_anchor(poly, e, u, D):
+    check = poly.inspect(e.detach().cpu().numpy(), u.detach().cpu().numpy())
+    # NumPy and CUDA can round reductions differently. Validate both the lifted
+    # float64 expression and the actual tensor expression consumed by ACIG.
+    for pairs, relation in ((poly.strict_pairs, 'strict'), (poly.tie_pairs, 'tie')):
+        if not pairs:
+            continue
+        indices = torch.tensor(pairs, dtype=torch.long, device=D.device)
+        gap = torch.sum(u*(D[indices[:, 0]]-e)**2, dim=1) - torch.sum(u*(D[indices[:, 1]]-e)**2, dim=1)
+        valid = torch.all(gap < 0) if relation == 'strict' else torch.all(torch.abs(gap) <= poly.config.tolerance)
+        check['tensor_'+relation+'_valid'] = bool(valid.item())
+        check['valid'] = bool(check['valid'] and valid.item())
+    return check
 
-    initial_anchor enables exact pairing without sharing the query-sampler RNG.
-    max_round retains the 500-round safeguard; zero-query relocations count too.
+
+def restore_anchor(poly, e, u, D):
+    start = time.perf_counter()
+    before = check_anchor(poly, e, u, D)
+    if before['valid']:
+        return e, u, dict(triggered=False, status='already_feasible', before=before,
+                          after=before, elapsed=time.perf_counter()-start, displacement=0.,
+                          margin=poly.margin_info)
+    en, un, diagnostic = poly.restore(e.detach().cpu().numpy(), u.detach().cpu().numpy())
+    candidates = [(en, un, diagnostic['status'])]
+    fallback = poly.decode(poly.witness, e.detach().cpu().numpy())
+    if fallback is not None:
+        candidates.append((*fallback, 'tensor_feasible_lp_fallback'))
+    for ev, uv, status in candidates:
+        et = torch.as_tensor(ev, dtype=D.dtype, device=D.device)
+        ut = torch.as_tensor(uv, dtype=D.dtype, device=D.device)
+        after = check_anchor(poly, et, ut, D)
+        if after['valid']:
+            old_u, old_e = u.detach().cpu().numpy(), e.detach().cpu().numpy()
+            actual_u, actual_e = ut.detach().cpu().numpy(), et.detach().cpu().numpy()
+            diagnostic.update(triggered=True, status=status, before=before, after=after,
+                              displacement=float(np.linalg.norm(np.r_[actual_u, actual_u*actual_e]-
+                                                                 np.r_[old_u, old_u*old_e])),
+                              elapsed=time.perf_counter()-start)
+            return et, ut, diagnostic
+    raise FeasibilityFailure('tensor_recovery_failed', before=before, margin=poly.margin_info)
+
+
+def learn(poly, D, e, u, max_iter=500, init_lr=.5, proximal_strength=1., trace=None):
+    """ACIG alternating descent, optionally stabilized around this round's restored anchor."""
+    if not check_anchor(poly, e, u, D)['valid']:
+        raise FeasibilityFailure('learning_started_from_invalid_anchor')
+    if not poly.strict_pairs:
+        return e, u
+    pairs = torch.tensor(poly.strict_pairs, dtype=torch.long, device=D.device)
+    P, Q = D[pairs[:, 0]], D[pairs[:, 1]]
+    lower = torch.as_tensor(poly.lower, dtype=D.dtype, device=D.device)
+    upper = torch.as_tensor(poly.upper, dtype=D.dtype, device=D.device)
+    reference_e, reference_u = e.clone(), u.clone()
+    span = torch.clamp(upper-lower, min=torch.finfo(D.dtype).eps)
+
+    def loss(et, ut):
+        fit = F.softplus(torch.sum(ut*(P-et)**2, dim=1)-torch.sum(ut*(Q-et)**2, dim=1)).sum()
+        proximity = .5*proximal_strength*(((et-reference_e)/span).square().sum() + (ut-reference_u).square().sum())
+        return (fit+proximity).item()
+
+    # Preserve the selected experimental sum-loss / mean-gradient arithmetic.
+    for iteration in range(max_iter):
+        prev_e, prev_u = e.clone(), u.clone()
+        terms = (P-e)**2-(Q-e)**2
+        # Match the original arithmetic for the gradient's score difference.
+        delta = torch.sum(u*(P-e)**2, dim=1)-torch.sum(u*(Q-e)**2, dim=1)
+        grad_u = torch.mean(torch.sigmoid(delta).unsqueeze(-1)*terms, dim=0) + proximal_strength*(u-reference_u)
+        previous, rate = loss(e, u), init_lr
+        while rate > 1e-5:
+            candidate = torch.clamp(u-rate*grad_u, .001, 1.)
+            candidate = candidate/candidate.sum()
+            if loss(e, candidate) < previous and check_anchor(poly, e, candidate, D)['valid']:
+                u = candidate
+                if trace is not None:
+                    trace(iteration, 'u', e, u, loss(e, u))
+                break
+            rate *= .5
+        delta = torch.sum(u*(P-e)**2, dim=1)-torch.sum(u*(Q-e)**2, dim=1)
+        grad_e = torch.mean(torch.sigmoid(delta).unsqueeze(-1)*(2*u*(Q-P)), dim=0) + proximal_strength*(e-reference_e)/span.square()
+        previous, rate = loss(e, u), init_lr
+        while rate > 1e-5:
+            candidate = torch.clamp(e-rate*grad_e, lower, upper)
+            if loss(candidate, u) < previous and check_anchor(poly, candidate, u, D)['valid']:
+                e = candidate
+                if trace is not None:
+                    trace(iteration, 'e', e, u, loss(e, u))
+                break
+            rate *= .5
+        if iteration > 50 and torch.linalg.norm(e-prev_e) < 1e-5 and torch.linalg.norm(u-prev_u) < 1e-5:
+            break
+    return e, u
+
+
+def challenger(poly, D, p, e, u, known_losers):
+    """No LP error/infeasibility is allowed to masquerade as certification."""
+    if not check_anchor(poly, e, u, D)['valid']:
+        raise FeasibilityFailure('invalid_anchor_before_challenger')
+    order = torch.argsort(get_weighted_distance_sq(D, e, u)).cpu().tolist()
+    for q in order:
+        if q == p or q in known_losers:
+            continue
+        row = poly.row(q, p)
+        result = poly.solve_linear(row)
+        if float(result.fun) >= -LP_ACC:
+            continue
+        # LP vertices can lose a tiny strict feedback margin when cast to
+        # float32. Blend toward the verified interior-feedback witness, while
+        # retaining at least half the challenger threshold in exact arithmetic.
+        minimum, witness_gap = float(result.fun), float(row@poly.witness)
+        alpha_limit = 1. if witness_gap <= minimum else min(
+            1., max(0., (-LP_ACC/2-minimum)/(witness_gap-minimum)))
+        for alpha in (0., min(1e-4, alpha_limit/2), min(.001, alpha_limit/2),
+                      min(.01, alpha_limit/2), min(.1, alpha_limit/2), alpha_limit/2):
+            theta = (1-alpha)*result.x+alpha*poly.witness
+            decoded = poly.decode(theta, e.detach().cpu().numpy())
+            if decoded is None:
+                continue
+            ep, up = [torch.as_tensor(x, dtype=D.dtype, device=D.device) for x in decoded]
+            tensor_gap = get_weighted_distance_sq(D[q], ep, up)-get_weighted_distance_sq(D[p], ep, up)
+            if check_anchor(poly, ep, up, D)['valid'] and tensor_gap.item() < 0:
+                return q, ep, up
+        raise FeasibilityFailure('challenger_tensor_validation_failed', challenger=q)
+    return None, None, None
+
+
+class _ATRecorder:
+    """Keep query-aligned plot data; detailed intermediate states are opt-in."""
+    def __init__(self, D, true_e, true_u, debug):
+        self.D, self.debug = D, bool(debug)
+        self.started = time.perf_counter()
+        self.extra_seconds = 0.
+        self.data = DATA
+        initialize_monitor(self.data, D, true_e, true_u)
+        self.data.update({
+            'Schema Version': 2, 'Algorithm': 'AT',
+            'State Semantics': 'feedback_feasible_operational_anchor',
+            'Debug Enabled': self.debug, 'Feedback': [], 'Query Route': [],
+            'Recommendation Route': [], 'Phase Route': [],
+            'Monitoring Notes': 'Time includes monitoring; true parameters only answer queries and evaluate results.',
+        })
+        if self.debug:
+            self.data.update({'State Events': [], 'Recovery Diagnostics': []})
+
+    def extra(self, operation):
+        synchronize(self.D.device)
+        started = time.perf_counter()
+        result = operation()
+        synchronize(self.D.device)
+        self.extra_seconds += time.perf_counter()-started
+        return result
+
+    def event(self, queries, e, u, indices, phase, *, anchor_valid=True, **details):
+        if not self.debug:
+            return
+        def append():
+            self.data['State Events'].append(dict(
+                queries=int(queries), phase=phase, e_u=[e.tolist(), u.tolist()],
+                recommendation=list(map(int, indices)),
+                anchor_valid=None if anchor_valid is None else bool(anchor_valid), **details))
+        self.extra(append)
+
+    def initial(self, e, u, p):
+        self.data['Initial E-U'] = [e.tolist(), u.tolist()]
+        self.data['Initial Recommendation'] = [int(p)]
+        self.event(0, e, u, [p], 'initial', anchor_valid=None)
+
+    def recovery(self, queries, phase, diagnostic, **details):
+        if self.debug:
+            self.data['Recovery Diagnostics'].append(dict(
+                queries=int(queries), phase=phase, **diagnostic, **details))
+
+    def paid(self, e, u, p, phase, valid=True):
+        record_query_state(self.data, e, u, self.started)
+        queries = len(self.data['E-U Route'])
+        self.data['Query Route'].append(queries)
+        self.data['Recommendation Route'].append([int(p)])
+        self.data['Phase Route'].append(phase)
+        self.data['Anchor Validity Route'].append(bool(valid))
+        self.event(queries, e, u, [p], phase, anchor_valid=valid)
+
+    def finish(self, e, u, p, reason, rounds, queries, valid):
+        self.event(queries, e, u, [p], 'terminal:'+reason, anchor_valid=valid)
+        self.data.update({'Final E-U': [e.tolist(), u.tolist()],
+                          'Final Recommendation': [int(p)], 'Termination': reason,
+                          'Rounds': int(rounds), 'Queries': int(queries),
+                          'Final Anchor Valid': bool(valid), 'Algorithm Valid': bool(valid)})
+        synchronize(self.D.device)
+        self.data['Final Time'] = time.perf_counter()-self.started
+        self.data['Monitoring Time'] = self.extra_seconds
+        assert queries == len(self.data['Time']) == len(self.data['E-U Route'])
+        assert queries == len(self.data['Recommendation Route']) == len(self.data['Feedback'])
+        assert queries == len(self.data['Feedback Records']) == len(self.data['Anchor Validity Route'])
+        assert queries == sum(event['cost'] for event in self.data['Comparisons'])
+        return int(p), int(rounds), int(queries)
+
+
+def anchor_tracking_algorithm(D, true_e, true_u, max_round=500,
+                              config=SelectionConfig(), initial_anchor=None, *,
+                              debug=False, recovery_config=None, proximal_strength=1.,
+                              query_budget=None):
+    """ACIG with joint recovery and per-query proximal alternating updates.
+
+    Native random initialization is the default used by the experiment runner.
+    initial_anchor remains an explicit programmatic hook for controlled tests.
+    LP jumps retain the selected experiment's direct feasible rebuttal anchor.
+    max_round includes zero-query relocations; debug only adds observations.
     """
-    started = time.perf_counter()
-    data = DATA
-    initialize_monitor(data, D, true_e, true_u)
+    if D.dtype not in (torch.float32, torch.float64):
+        raise ValueError('AT requires float32 or float64 data')
+    if max_round < 0 or (query_budget is not None and query_budget < 0):
+        raise ValueError('Invalid query/round cap')
+    if not np.isfinite(proximal_strength) or proximal_strength < 0:
+        raise ValueError('proximal_strength must be finite and nonnegative')
+    dtype = 'float64' if D.dtype == torch.float64 else 'float32'
+    configure(dtype)
+    recovery_config = recovery_config or RecoveryConfig.for_dtype(dtype)
+    recorder = _ATRecorder(D, true_e, true_u, debug)
+    data = recorder.data
     if initial_anchor is None:
         lower, upper = D.min(dim=0).values, D.max(dim=0).values
+        # Preserve native ACIG draws, including their default tensor precision.
         e = lower+torch.rand(D.shape[1], device=D.device)*(upper-lower)
-        u = torch.distributions.Dirichlet(torch.ones(D.shape[1],device=D.device)).sample()
+        u = torch.distributions.Dirichlet(torch.ones(D.shape[1], device=D.device)).sample()
     else:
-        e, u = [torch.as_tensor(x,dtype=D.dtype,device=D.device).clone() for x in initial_anchor]
-    data["Initial E-U"] = [e.tolist(), u.tolist()]
-    cache = ComparisonCache(D,true_e,true_u)
-    data["Comparisons"], data["C Decisions"] = cache.events, []
-    history = []
-    data["Feedback"] = history
+        e, u = [torch.as_tensor(x, dtype=D.dtype, device=D.device).clone() for x in initial_anchor]
+    cache = ComparisonCache(D, true_e, true_u)
+    records = []
+    data.update({'Initialization': 'random' if initial_anchor is None else 'supplied',
+                 'Comparisons': cache.events, 'C Decisions': [], 'Feedback Records': records,
+                 'Anchor Validity Route': [], 'Feasibility Config': vars(recovery_config),
+                 'Variant': 'AT_joint_recovery' if proximal_strength == 0 else 'AT_joint_stable',
+                 'Proximal Strength': float(proximal_strength),
+                 'Proximal Reference': 'per-query restored feasible anchor'})
     points = D.detach().cpu().numpy().astype(np.float64)
-    sampler = FeasibleSamples(points,config)
-    rounds = 0
-    while rounds < max_round:
-        p, _ = at_find_nearest_neighbor(D,e,u)
-        # A cache may already prove certain challengers lose to this incumbent.
-        # These exclusions are rebuilt for each incumbent, never carried globally.
-        known_losers = set()
-        for (left,right), outcome in cache.answers.items():
-            if outcome == -1 and p == left:
-                known_losers.add(right)
-            elif outcome == 1 and p == right:
-                known_losers.add(left)
-        q, ep, up = at_check_stopping_condition_LP(
-            history,D,p,e,u,known_losers,device=D.device)
-        if q is None:
-            data["Termination"] = "LP"
-            data["Feedback"] = history
-            return p,rounds,cache.queries_used
+    sampler = FeasibleSamples(points, config)
+    poly, rounds = None, 0
+    p, _ = at_find_nearest_neighbor(D, e, u)
+    recorder.initial(e, u, p)
 
-        key = tuple(sorted((p,q)))
-        if key in cache.answers:
-            # Relocate the anchor when a known answer already rejects the incumbent.
-            prefers_p, _ = cache.compare(p,q,"cached_rebuttal")
-            if not prefers_p and cache.answers[key] != 0:
-                e,u = ep,up
-                data["C Decisions"].append(dict(round=rounds,action="cached_relocation",pair=[p,q]))
+    def finish(reason, failure=None):
+        final_p, _ = at_find_nearest_neighbor(D, e, u)
+        valid = failure is None and poly is not None and check_anchor(poly, e, u, D)['valid']
+        if failure is not None:
+            data['Failure'] = dict(status=failure.status, **failure.details)
+        return recorder.finish(e, u, final_p, reason, rounds, cache.queries_used, valid)
+
+    try:
+        poly = FeedbackPolytope(points, records, recovery_config, dtype)
+        e, u, initial_diag = restore_anchor(poly, e, u, D)
+        if debug:
+            data['State Events'][0]['anchor_valid'] = initial_diag['before']['valid']
+        if initial_diag['triggered']:
+            recorder.recovery(0, 'initial', initial_diag)
+            initial_p, _ = at_find_nearest_neighbor(D, e, u)
+            recorder.event(0, e, u, [initial_p], 'initial_recovery')
+        while rounds < max_round:
+            p, _ = at_find_nearest_neighbor(D, e, u)
+            known_losers = {loser for winner, loser in poly.strict_pairs if winner == p}
+            known_losers.update(right if left == p else left
+                               for left, right in poly.tie_pairs if p in (left, right))
+            q, ep, up = at_check_stopping_condition_LP(
+                records, D, p, e, u, known_losers, device=D.device, poly=poly)
+            if q is None:
+                data['Certification'] = dict(kind='LP_within_configured_margin_and_tolerance',
+                                              **poly.description())
+                return finish('LP')
+            if debug:
+                rebuttal_p, _ = at_find_nearest_neighbor(D, ep, up)
+                recorder.event(cache.queries_used, ep, up, [rebuttal_p], 'lp_rebuttal',
+                               incumbent=p, rebuttal=q)
+            key = tuple(sorted((p, q)))
+            if key in cache.answers:
+                prefers_p, _ = cache.compare(p, q, 'cached_rebuttal')
+                if prefers_p or cache.answers[key] == 0:
+                    raise FeasibilityFailure('cached_rebuttal_conflict')
+                e, u, diagnostic = restore_anchor(poly, ep, up, D)
+                recorder.recovery(cache.queries_used, 'cached_relocation', diagnostic)
+                data['C Decisions'].append(dict(round=rounds, action='cached_relocation', pair=[p, q]))
+                new_p, _ = at_find_nearest_neighbor(D, e, u)
+                recorder.event(cache.queries_used, e, u, [new_p], 'cached_relocation')
                 rounds += 1
                 continue
-            # The strict LP and an exact tied answer can disagree; do not loop or
-            # certify convergence based on sample consensus / a missing question.
-            data["Termination"] = "cached_rebuttal_conflict"
-            data["Feedback"] = history
-            return p,rounds,cache.queries_used
+            if query_budget is not None and cache.queries_used >= query_budget:
+                return finish('query_budget')
+            u_chain, u_states = at_construct_q_chain_alternating(D, e, u, ep, up, True)
+            e_chain, e_states = at_construct_q_chain_alternating(D, e, u, ep, up, False)
+            candidates = candidate_pairs(u_chain, e_chain, p, q, cache.answers)
+            samples = sampler.draw(poly)
+            pair, info = select_pair(points, samples, candidates, config.tolerance)
+            if pair is None:
+                raise FeasibilityFailure('no_unseen_candidate')
+            left, right = pair
+            prefers_left, cost = cache.compare(left, right, 'C:'+'+'.join(info['sources']))
+            if cost != 1:
+                raise FeasibilityFailure('selected_cached_question')
+            winner, loser = (left, right) if prefers_left else (right, left)
+            tied = cache.answers[tuple(sorted(pair))] == 0
+            data['Feedback'].append((winner, loser))  # one legacy entry per paid question
+            records.append(dict(left=left if tied else winner, right=right if tied else loser,
+                                relation='tie' if tied else 'strict'))
+            poly = FeedbackPolytope(points, records, recovery_config, dtype)
+            if debug:
+                recorder.event(cache.queries_used, e, u, [p], 'feedback_received',
+                               anchor_valid=check_anchor(poly, e, u, D)['valid'],
+                               pair=list(pair), tied=tied)
+            if pair == key and winner == q and not tied:
+                # Keep the LP jump. No landing optimization or extra descent is added.
+                e, u, diagnostic = restore_anchor(poly, ep, up, D)
+                update = 'A_rebuttal_jump'
+            else:
+                e, u, diagnostic = restore_anchor(poly, e, u, D)
+                restored_e, restored_u = e.clone(), u.clone()
+                if debug:
+                    restored_p, _ = at_find_nearest_neighbor(D, e, u)
+                    recorder.event(cache.queries_used, e, u, [restored_p], 'joint_recovery')
+                    diagnostic['proximal_reference_e_u'] = [e.tolist(), u.tolist()]
 
-        u_chain, _ = at_construct_q_chain_alternating(D,e,u,ep,up,True)
-        e_chain, _ = at_construct_q_chain_alternating(D,e,u,ep,up,False)
-        candidates = candidate_pairs(u_chain,e_chain,p,q,cache.answers)
-        samples = sampler.draw(history)
-        pair, info = select_pair(points,samples,candidates,config.tolerance)
-        if pair is None:
-            raise RuntimeError("AT has an unseen rebuttal but no candidate question")
-        left,right = pair
-        source = "C:"+"+".join(info["sources"])
-        prefers_left,cost = cache.compare(left,right,source)
-        if cost != 1:
-            raise RuntimeError("AT selected an already answered question")
-        winner,loser = (left,right) if prefers_left else (right,left)
-        history.append((winner,loser))
-        if pair == key and winner == q:
-            e,u = ep,up  # use the feasible rebuttal anchor
-            update = "A_rebuttal_jump"
-        else:
-            e,u = at_alternating_learning(D,history,e,u,device=D.device)
-            update = "A_alternating_learning"
-        record_query_state(data, e, u, started)
-        data["C Decisions"].append(dict(round=rounds,action="ask_one",pair=list(pair),
-                                         winner=winner,incumbent=p,rebuttal=q,
-                                         u_chain_length=len(u_chain),e_chain_length=len(e_chain),
-                                         candidate_count=len(candidates),sampler_status=sampler.last_status,
-                                         anchor_update=update,**info))
-        rounds += 1
-    data["Termination"] = "max_round"
-    data["Feedback"] = history
-    p,_ = at_find_nearest_neighbor(D,e,u)
-    return p,rounds,cache.queries_used
+                def trace(iteration, coordinate, et, ut, loss):
+                    current_p, _ = at_find_nearest_neighbor(D, et, ut)
+                    recorder.event(cache.queries_used, et, ut, [current_p], 'learning_'+coordinate,
+                                   iteration=int(iteration), loss=float(loss))
+
+                e, u = learn(poly, D, e, u, proximal_strength=proximal_strength,
+                             trace=trace if debug else None)
+                if not check_anchor(poly, e, u, D)['valid']:
+                    e, u = restored_e, restored_u
+                    diagnostic['learning_fallback'] = 'restored_anchor'
+                update = ('A_joint_recovery_then_alternating' if proximal_strength == 0 else
+                          'A_joint_recovery_then_proximal_alternating')
+            after = check_anchor(poly, e, u, D)
+            if not after['valid']:
+                raise FeasibilityFailure('invalid_anchor_before_record', check=after)
+            recorder.recovery(cache.queries_used, update, diagnostic, final_check=after)
+            current_p = recorder.extra(lambda: at_find_nearest_neighbor(D, e, u)[0])
+            recorder.paid(e, u, current_p, update)
+            decision = dict(round=rounds, action='ask_one', pair=list(pair),
+                winner=None if tied else winner, tied=tied, incumbent=p, rebuttal=q,
+                u_chain_length=len(u_chain), e_chain_length=len(e_chain), candidate_count=len(candidates),
+                sampler_status=sampler.last_status, anchor_update=update, **info)
+            if debug:
+                decision.update(u_chain=list(u_chain), e_chain=list(e_chain),
+                                u_chain_e_u=[[et.tolist(), ut.tolist()] for et, ut in u_states],
+                                e_chain_e_u=[[et.tolist(), ut.tolist()] for et, ut in e_states],
+                                candidates=[dict(pair=list(k), sources=v) for k, v in candidates.items()],
+                                rebuttal_e_u=[ep.tolist(), up.tolist()])
+            data['C Decisions'].append(decision)
+            rounds += 1
+        return finish('max_round')
+    except FeasibilityFailure as failure:
+        # Account for a paid query even when its new feedback cannot be restored.
+        # Mark the old anchor invalid rather than accepting it as a solution.
+        if cache.queries_used > len(data['E-U Route']):
+            current_p, _ = at_find_nearest_neighbor(D, e, u)
+            recorder.paid(e, u, current_p, 'invalid_state:'+failure.status, valid=False)
+        return finish('feasibility_failure', failure)
 
 
 def main(args, output_dir=None, config=SelectionConfig()):
@@ -649,11 +792,14 @@ def main(args, output_dir=None, config=SelectionConfig()):
 
     def solve(D, true_e, true_u, case):
         p, rounds, queries = anchor_tracking_algorithm(
-            D, true_e, true_u, config=replace(config, seed=config.seed + case))
+            D, true_e, true_u, config=replace(config, seed=config.seed + case),
+            debug=getattr(args, "debug", False))
         events = DATA["Comparisons"]
         diagnostics = dict(rounds=rounds, comparison_requests=len(events),
                            cache_hits=sum(event["cached"] for event in events),
                            returned_index=p, termination=DATA["Termination"],
+                           algorithm_valid=DATA["Algorithm Valid"],
+                           final_anchor_valid=DATA["Final Anchor Valid"],
                            information_selections=sum(x.get("reason") == "best_item_information_gain"
                                                       for x in DATA["C Decisions"]),
                            selection_fallbacks=sum(x.get("fallback", False) for x in DATA["C Decisions"]))
