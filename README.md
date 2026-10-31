@@ -14,6 +14,11 @@ the selected data's coordinate-wise bounds and weights from
 `Dirichlet(1, ..., 1)`. These hidden parameters answer comparisons and evaluate
 the returned tuple.
 
+## Supplementary appendix
+
+The [supplementary appendix](appendix.pdf) contains additional proofs, the AT
+stopping-condition formulation, and learning-behavior results on Car and Flight.
+
 ## Repository contents
 
 | Path | Purpose |
