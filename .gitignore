@@ -10,7 +10,16 @@ nbaRS/
 generator/build
 generator/test
 *.pdf
+!/appendix.pdf
 *.zip
 *.xlsx
 *.json
 *.log
+experiments/
+figure/
+history/
+paper/
+tmp/
+tests/
+新图/
+output/
